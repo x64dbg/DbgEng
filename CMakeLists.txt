@@ -82,6 +82,11 @@ if(MSVC) # msvc
 	)
 endif()
 
+set_target_properties(testlib PROPERTIES
+	MSVC_RUNTIME_LIBRARY
+		"MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
+)
+
 # Target: testapp
 set(testapp_SOURCES
 	cmake.toml
@@ -108,6 +113,11 @@ if(MSVC) # msvc
 		"/DYNAMICBASE:NO"
 	)
 endif()
+
+set_target_properties(testapp PROPERTIES
+	MSVC_RUNTIME_LIBRARY
+		"MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
+)
 
 get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
 if(NOT CMKR_VS_STARTUP_PROJECT)

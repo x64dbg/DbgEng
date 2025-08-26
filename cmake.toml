@@ -12,11 +12,13 @@ msvc.link-options = ["/DELAYLOAD:dbgeng.dll"]
 
 [target.testlib]
 type = "shared"
+msvc-runtime = "dynamic"
 sources = ["src/testlib/testlib.cpp"]
 msvc.link-options = ["/INCREMENTAL:NO", "/DYNAMICBASE:NO"]
 
 [target.testapp]
 type = "executable"
+msvc-runtime = "dynamic"
 sources = ["src/testapp/testapp.cpp", "src/testapp/debug.h"]
 msvc.link-options = ["/INCREMENTAL:NO", "/DYNAMICBASE:NO"]
 link-libraries = ["::testlib"]
