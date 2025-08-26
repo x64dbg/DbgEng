@@ -8,6 +8,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <Windows.h>
+#include <format>
 
 #include <DbgEng.h>
 #include <delayimp.h>
@@ -27,6 +28,22 @@ static FARPROC WINAPI delayHook(unsigned dliNotify, PDelayLoadInfo pdli)
 }
 
 const PfnDliHook __pfnDliNotifyHook2 = delayHook;
+
+template<class... Args>
+void logDebug(const std::format_string<Args...> fmt, Args&&... args)
+{
+    printf("[debug] %s\n", std::format(fmt, std::forward<Args>(args)...).c_str());
+}
+
+std::string Utf16ToUtf8(const wchar_t* wstr)
+{
+    int requiredSize = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, 0, 0, 0, 0);
+    if (requiredSize <= 0)
+        return {};
+    std::string utf8(requiredSize, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wstr, -1, &utf8[0], requiredSize, 0, 0);
+    return utf8;
+}
 
 // Forward declarations
 class SimpleDebugger;
@@ -71,7 +88,7 @@ public:
                 DEBUG_EVENT_LOAD_MODULE | DEBUG_EVENT_UNLOAD_MODULE |
                 DEBUG_EVENT_SYSTEM_ERROR | DEBUG_EVENT_SESSION_STATUS |
                 DEBUG_EVENT_CHANGE_DEBUGGEE_STATE | DEBUG_EVENT_CHANGE_ENGINE_STATE |
-                DEBUG_EVENT_CHANGE_SYMBOL_STATE;
+                DEBUG_EVENT_CHANGE_SYMBOL_STATE | DEBUG_EVENT_SERVICE_EXCEPTION;
         return S_OK;
     }
 
@@ -80,7 +97,7 @@ public:
         ULONG64 offset;
         if (SUCCEEDED(Bp->GetOffset(&offset)))
         {
-            printf("Breakpoint hit at 0x%016llx\n", offset);
+            logDebug("Breakpoint hit at {:#x}", offset);
         }
         return DEBUG_STATUS_BREAK;
     }
@@ -90,20 +107,21 @@ public:
         if (Exception->ExceptionCode == STATUS_BREAKPOINT)
         {
             printf("Initial breakpoint hit at 0x%016llx\n", Exception->ExceptionAddress);
-            return DEBUG_STATUS_BREAK;
         }
         else if (Exception->ExceptionCode == STATUS_SINGLE_STEP)
         {
             printf("Single step completed at 0x%016llx\n", Exception->ExceptionAddress);
-            return DEBUG_STATUS_BREAK;
         }
         else if (Exception->ExceptionCode == STATUS_ACCESS_VIOLATION)
         {
             printf("Access violation at 0x%016llx\n", Exception->ExceptionAddress);
-            return DEBUG_STATUS_BREAK;
+        }
+        else
+        {
+            printf("Exception 0x%08x at 0x%016llx\n", Exception->ExceptionCode, Exception->ExceptionAddress);
         }
 
-        return FirstChance ? DEBUG_STATUS_NO_CHANGE : DEBUG_STATUS_BREAK;
+        return DEBUG_STATUS_BREAK;
     }
 
     STDMETHOD(CreateThread)(ULONG64 Handle, ULONG64 DataOffset, ULONG64 StartOffset) override
