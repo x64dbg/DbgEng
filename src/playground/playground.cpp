@@ -35,12 +35,18 @@ void logDebug(const std::format_string<Args...> fmt, Args&&... args)
     printf("[debug] %s\n", std::format(fmt, std::forward<Args>(args)...).c_str());
 }
 
+template<class...Args>
+void print(const std::format_string<Args...> fmt, Args&&... args)
+{
+    puts(std::format(fmt, std::forward<Args>(args)...).c_str());
+}
+
 std::string Utf16ToUtf8(const wchar_t* wstr)
 {
     int requiredSize = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, 0, 0, 0, 0);
     if (requiredSize <= 0)
         return {};
-    std::string utf8(requiredSize, '\0');
+    std::string utf8(requiredSize - 1, '\0');
     WideCharToMultiByte(CP_UTF8, 0, wstr, -1, &utf8[0], requiredSize, 0, 0);
     return utf8;
 }
@@ -106,19 +112,19 @@ public:
     {
         if (Exception->ExceptionCode == STATUS_BREAKPOINT)
         {
-            printf("Initial breakpoint hit at 0x%016llx\n", Exception->ExceptionAddress);
+            logDebug("Initial breakpoint hit at {:#x}", Exception->ExceptionAddress);
         }
         else if (Exception->ExceptionCode == STATUS_SINGLE_STEP)
         {
-            printf("Single step completed at 0x%016llx\n", Exception->ExceptionAddress);
+            logDebug("Single step completed at {:#x}", Exception->ExceptionAddress);
         }
         else if (Exception->ExceptionCode == STATUS_ACCESS_VIOLATION)
         {
-            printf("Access violation at 0x%016llx\n", Exception->ExceptionAddress);
+            logDebug("Access violation at {:#x}", Exception->ExceptionAddress);
         }
         else
         {
-            printf("Exception 0x%08x at 0x%016llx\n", Exception->ExceptionCode, Exception->ExceptionAddress);
+            logDebug("Exception {:#x} at {:#x}", Exception->ExceptionCode, Exception->ExceptionAddress);
         }
 
         return DEBUG_STATUS_BREAK;
@@ -126,7 +132,7 @@ public:
 
     STDMETHOD(CreateThread)(ULONG64 Handle, ULONG64 DataOffset, ULONG64 StartOffset) override
     {
-        printf("Thread created - Handle: 0x%016llx, DataOffset: 0x%016llx, StartOffset: 0x%016llx\n",
+        logDebug("Thread created - Handle: {:#x}, DataOffset: {:#x}, StartOffset: {:#x}",
             Handle,
             DataOffset,
             StartOffset);
@@ -135,27 +141,28 @@ public:
 
     STDMETHOD(ExitThread)(ULONG ExitCode) override
     {
-        printf("Thread exited with code: %lu (0x%08x)\n", ExitCode, ExitCode);
+        logDebug("Thread exited with code: {} ({:#x})", ExitCode, ExitCode);
         return DEBUG_STATUS_NO_CHANGE;
     }
 
     STDMETHOD(CreateProcess)(ULONG64 ImageFileHandle, ULONG64 Handle, ULONG64 BaseOffset, ULONG ModuleSize, PCWSTR ModuleName, PCWSTR ImageName, ULONG CheckSum, ULONG TimeDateStamp, ULONG64 InitialThreadHandle, ULONG64 ThreadDataOffset, ULONG64 StartOffset) override
     {
-        wprintf(L"Process created: %ls (base: 0x%016llx)\n", ImageName ? ImageName : L"Unknown", BaseOffset);
+        logDebug("Process created: {} (base: {:#x})",
+            ImageName ? Utf16ToUtf8(ImageName) : "Unknown", BaseOffset);
         return DEBUG_STATUS_NO_CHANGE;
     }
 
     STDMETHOD(ExitProcess)(ULONG ExitCode) override
     {
-        printf("Process exited with code: %lu\n", ExitCode);
+        logDebug("Process exited with code: {}", ExitCode);
         return DEBUG_STATUS_NO_CHANGE;
     }
 
     STDMETHOD(LoadModule)(ULONG64 ImageFileHandle, ULONG64 BaseOffset, ULONG ModuleSize, PCWSTR ModuleName, PCWSTR ImageName, ULONG CheckSum, ULONG TimeDateStamp) override
     {
-        wprintf(L"Module loaded: %ls (%ls) - Base: 0x%016llx, Size: 0x%08x, Checksum: 0x%08x, Timestamp: 0x%08x\n",
-            ImageName ? ImageName : L"Unknown",
-            ModuleName ? ModuleName : L"Unknown",
+        logDebug("Module loaded: {} ({}) - Base: {:#x}, Size: {:#x}, Checksum: {:#x}, Timestamp: {:#x}",
+            ImageName ? Utf16ToUtf8(ImageName) : "Unknown",
+            ModuleName ? Utf16ToUtf8(ModuleName) : "Unknown",
             BaseOffset,
             ModuleSize,
             CheckSum,
@@ -165,15 +172,15 @@ public:
 
     STDMETHOD(UnloadModule)(PCWSTR ImageBaseName, ULONG64 BaseOffset) override
     {
-        wprintf(L"Module unloaded: %ls - Base: 0x%016llx\n",
-            ImageBaseName ? ImageBaseName : L"Unknown",
+        logDebug("Module unloaded: {} - Base: {:#x}",
+            ImageBaseName ? Utf16ToUtf8(ImageBaseName) : "Unknown",
             BaseOffset);
         return DEBUG_STATUS_NO_CHANGE;
     }
 
     STDMETHOD(SystemError)(ULONG Error, ULONG Level) override
     {
-        printf("System error occurred - Error: %lu (0x%08x), Level: %lu\n",
+        logDebug("System error occurred - Error: {} ({:#x}), Level: {}",
             Error,
             Error,
             Level);
@@ -210,13 +217,13 @@ public:
             statusStr = "Failure";
             break;
         }
-        printf("Session status changed: %s (%lu)\n", statusStr, Status);
+        logDebug("Session status changed: {} ({})", statusStr, Status);
         return S_OK;
     }
 
     STDMETHOD(ChangeDebuggeeState)(ULONG Flags, ULONG64 Argument) override
     {
-        printf("Debuggee state changed - Flags: 0x%08x, Argument: 0x%016llx\n",
+        logDebug("Debuggee state changed - Flags: {:#x}, Argument: {:#x}",
             Flags,
             Argument);
 
@@ -224,19 +231,19 @@ public:
         switch (Flags)
         {
         case DEBUG_CDS_ALL:
-            printf("  - A general change in the target has occurred.\n");
+            logDebug("  - A general change in the target has occurred.");
             break;
         case DEBUG_CDS_REGISTERS:
-            printf("  - Registers changed\n");
+            logDebug("  - Registers changed");
             break;
         case DEBUG_CDS_DATA:
-            printf("  - Data/memory changed\n");
+            logDebug("  - Data/memory changed");
             break;
         case DEBUG_CDS_REFRESH:
-            printf("  - Refresh requested\n");
+            logDebug("  - Refresh requested");
             break;
         default:
-            printf("  - Unknown change\n");
+            logDebug("  - Unknown change");
             break;
         }
 
@@ -245,66 +252,66 @@ public:
 
     STDMETHOD(ChangeEngineState)(ULONG Flags, ULONG64 Argument) override
     {
-        printf("Engine state changed - Flags: 0x%08x, Argument: 0x%016llx\n",
+        logDebug("Engine state changed - Flags: {:#x}, Argument: {:#x}",
             Flags,
             Argument);
 
         // Decode common flags for better understanding
         if (Flags & DEBUG_CES_CURRENT_THREAD)
-            printf("  - Current thread changed\n");
+            logDebug("  - Current thread changed");
         if (Flags & DEBUG_CES_EFFECTIVE_PROCESSOR)
-            printf("  - Effective processor changed\n");
+            logDebug("  - Effective processor changed");
         if (Flags & DEBUG_CES_BREAKPOINTS)
-            printf("  - Breakpoints changed\n");
+            logDebug("  - Breakpoints changed");
         if (Flags & DEBUG_CES_CODE_LEVEL)
-            printf("  - Code level changed\n");
+            logDebug("  - Code level changed");
         if (Flags & DEBUG_CES_EXECUTION_STATUS)
-            printf("  - Execution status changed\n");
+            logDebug("  - Execution status changed");
         if (Flags & DEBUG_CES_ENGINE_OPTIONS)
-            printf("  - Engine options changed\n");
+            logDebug("  - Engine options changed");
         if (Flags & DEBUG_CES_LOG_FILE)
-            printf("  - Log file changed\n");
+            logDebug("  - Log file changed");
         if (Flags & DEBUG_CES_RADIX)
-            printf("  - Radix changed\n");
+            logDebug("  - Radix changed");
         if (Flags & DEBUG_CES_EVENT_FILTERS)
-            printf("  - Event filters changed\n");
+            logDebug("  - Event filters changed");
         if (Flags & DEBUG_CES_PROCESS_OPTIONS)
-            printf("  - Process options changed\n");
+            logDebug("  - Process options changed");
         if (Flags & DEBUG_CES_EXTENSIONS)
-            printf("  - Extensions changed\n");
+            logDebug("  - Extensions changed");
         if (Flags & DEBUG_CES_SYSTEMS)
-            printf("  - Systems changed\n");
+            logDebug("  - Systems changed");
         if (Flags & DEBUG_CES_ASSEMBLY_OPTIONS)
-            printf("  - Assembly options changed\n");
+            logDebug("  - Assembly options changed");
         if (Flags & DEBUG_CES_EXPRESSION_SYNTAX)
-            printf("  - Expression syntax changed\n");
+            logDebug("  - Expression syntax changed");
         if (Flags & DEBUG_CES_TEXT_REPLACEMENTS)
-            printf("  - Text replacements changed\n");
+            logDebug("  - Text replacements changed");
 
         return S_OK;
     }
 
     STDMETHOD(ChangeSymbolState)(ULONG Flags, ULONG64 Argument) override
     {
-        printf("Symbol state changed - Flags: 0x%08x, Argument: 0x%016llx\n",
+        logDebug("Symbol state changed - Flags: {:#x}, Argument: {:#x}",
             Flags,
             Argument);
 
         // Decode common flags for better understanding
         if (Flags & DEBUG_CSS_LOADS)
-            printf("  - Symbol loads changed\n");
+            logDebug("  - Symbol loads changed");
         if (Flags & DEBUG_CSS_UNLOADS)
-            printf("  - Symbol unloads changed\n");
+            logDebug("  - Symbol unloads changed");
         if (Flags & DEBUG_CSS_SCOPE)
-            printf("  - Symbol scope changed\n");
+            logDebug("  - Symbol scope changed");
         if (Flags & DEBUG_CSS_PATHS)
-            printf("  - Symbol paths changed\n");
+            logDebug("  - Symbol paths changed");
         if (Flags & DEBUG_CSS_SYMBOL_OPTIONS)
-            printf("  - Symbol options changed\n");
+            logDebug("  - Symbol options changed");
         if (Flags & DEBUG_CSS_TYPE_OPTIONS)
-            printf("  - Type options changed\n");
+            logDebug("  - Type options changed");
         if (Flags & DEBUG_CSS_COLLAPSE_CHILDREN)
-            printf("  - Collapse children changed\n");
+            logDebug("  - Collapse children changed");
 
         return DEBUG_STATUS_NO_CHANGE;
     }
@@ -346,7 +353,7 @@ public:
         HRESULT hr = DebugCreate(__uuidof(IDebugClient9), reinterpret_cast<void**>(&m_debugClient));
         if (FAILED(hr))
         {
-            printf("Failed to create IDebugClient9: 0x%08x\n", hr);
+            print("Failed to create IDebugClient9: {:#x}", (uint32_t)hr);
             return false;
         }
 
@@ -354,35 +361,35 @@ public:
         hr = m_debugClient->QueryInterface(__uuidof(IDebugControl), reinterpret_cast<void**>(&m_debugControl));
         if (FAILED(hr))
         {
-            printf("Failed to get IDebugControl: 0x%08x\n", hr);
+            print("Failed to get IDebugControl: {:#x}", (uint32_t)hr);
             return false;
         }
 
         hr = m_debugClient->QueryInterface(__uuidof(IDebugDataSpaces), reinterpret_cast<void**>(&m_debugDataSpaces));
         if (FAILED(hr))
         {
-            printf("Failed to get IDebugDataSpaces: 0x%08x\n", hr);
+            print("Failed to get IDebugDataSpaces: {:#x}", (uint32_t)hr);
             return false;
         }
 
         hr = m_debugClient->QueryInterface(__uuidof(IDebugRegisters), reinterpret_cast<void**>(&m_debugRegisters));
         if (FAILED(hr))
         {
-            printf("Failed to get IDebugRegisters: 0x%08x\n", hr);
+            print("Failed to get IDebugRegisters: {:#x}", (uint32_t)hr);
             return false;
         }
 
         hr = m_debugClient->QueryInterface(__uuidof(IDebugSymbols), reinterpret_cast<void**>(&m_debugSymbols));
         if (FAILED(hr))
         {
-            printf("Failed to get IDebugSymbols: 0x%08x\n", hr);
+            print("Failed to get IDebugSymbols: {:#x}", (uint32_t)hr);
             return false;
         }
 
         hr = m_debugClient->QueryInterface(__uuidof(IDebugSystemObjects), reinterpret_cast<void**>(&m_debugSystemObjects));
         if (FAILED(hr))
         {
-            printf("Failed to get IDebugSystemObjects: 0x%08x\n", hr);
+            print("Failed to get IDebugSystemObjects: {:#x}", (uint32_t)hr);
             return false;
         }
 
@@ -391,7 +398,7 @@ public:
         hr = m_debugClient->SetEventCallbacksWide(m_eventCallbacks);
         if (FAILED(hr))
         {
-            printf("Failed to set event callbacks: 0x%08x\n", hr);
+            print("Failed to set event callbacks: {:#x}", (uint32_t)hr);
             return false;
         }
 
@@ -399,7 +406,7 @@ public:
         hr = m_debugControl->SetEngineOptions(DEBUG_ENGOPT_INITIAL_BREAK | DEBUG_ENGOPT_DISABLE_MODULE_SYMBOL_LOAD);
         if (FAILED(hr))
         {
-            printf("Failed to set engine options: 0x%08x\n", hr);
+            print("Failed to set engine options: {:#x}", (uint32_t)hr);
             return false;
         }
 
@@ -411,14 +418,14 @@ public:
     {
         if (!m_debugActive)
         {
-            printf("Debugger not initialized\n");
+            print("Debugger not initialized");
             return false;
         }
 
         HRESULT hr = m_debugClient->CreateProcess(0, const_cast<char*>(executablePath), DEBUG_ONLY_THIS_PROCESS);
         if (FAILED(hr))
         {
-            printf("Failed to create process: 0x%08x\n", hr);
+            print("Failed to create process: {:#x}", (uint32_t)hr);
             return false;
         }
 
@@ -426,12 +433,12 @@ public:
         hr = m_debugControl->WaitForEvent(DEBUG_WAIT_DEFAULT, INFINITE);
         if (FAILED(hr))
         {
-            printf("Failed to wait for initial event: 0x%08x\n", hr);
+            print("Failed to wait for initial event: {:#x}", (uint32_t)hr);
             return false;
         }
 
         m_processRunning = true;
-        printf("Debugger started. Process created.\n");
+        print("Debugger started. Process created.");
         return true;
     }
 
@@ -489,7 +496,7 @@ public:
         }
         else
         {
-            printf("Unknown command: %s (type 'help' for available commands)\n", cmd.c_str());
+            print("Unknown command: {} (type 'help' for available commands)", cmd);
             return true;
         }
     }
@@ -499,24 +506,24 @@ private:
     {
         if (!m_processRunning)
         {
-            printf("No process running\n");
+            print("No process running");
             return true;
         }
 
         HRESULT hr = m_debugControl->SetExecutionStatus(DEBUG_STATUS_GO);
         if (FAILED(hr))
         {
-            printf("Failed to resume execution: 0x%08x\n", hr);
+            print("Failed to resume execution: {:#x}", (uint32_t)hr);
             return true;
         }
 
-        printf("Running...\n");
+        print("Running...");
 
         // Wait for next event
         hr = m_debugControl->WaitForEvent(DEBUG_WAIT_DEFAULT, INFINITE);
         if (FAILED(hr))
         {
-            printf("WaitForEvent failed: 0x%08x\n", hr);
+            print("WaitForEvent failed: {:#x}", (uint32_t)hr);
             return true;
         }
 
@@ -535,14 +542,14 @@ private:
     {
         if (!m_processRunning)
         {
-            printf("No process running\n");
+            print("No process running");
             return true;
         }
 
         ULONG64 address = ParseAddress(addrStr);
         if (address == 0)
         {
-            printf("Invalid address: %s\n", addrStr.c_str());
+            print("Invalid address: {}", addrStr);
             return true;
         }
 
@@ -550,14 +557,14 @@ private:
         HRESULT hr = m_debugControl->AddBreakpoint(DEBUG_BREAKPOINT_CODE, DEBUG_ANY_ID, &bp);
         if (FAILED(hr))
         {
-            printf("Failed to add breakpoint: 0x%08x\n", hr);
+            print("Failed to add breakpoint: {:#x}", (uint32_t)hr);
             return true;
         }
 
         hr = bp->SetOffset(address);
         if (FAILED(hr))
         {
-            printf("Failed to set breakpoint offset: 0x%08x\n", hr);
+            print("Failed to set breakpoint offset: {:#x}", (uint32_t)hr);
             bp->Release();
             return true;
         }
@@ -565,13 +572,13 @@ private:
         hr = bp->SetFlags(DEBUG_BREAKPOINT_ENABLED);
         if (FAILED(hr))
         {
-            printf("Failed to enable breakpoint: 0x%08x\n", hr);
+            print("Failed to enable breakpoint: {:#x}", (uint32_t)hr);
             bp->Release();
             return true;
         }
 
         m_breakpoints.push_back(bp);
-        printf("Breakpoint set at 0x%016llx\n", address);
+        print("Breakpoint set at {:#x}", address);
         return true;
     }
 
@@ -580,7 +587,7 @@ private:
         ULONG64 address = ParseAddress(addrStr);
         if (address == 0)
         {
-            printf("Invalid address: %s\n", addrStr.c_str());
+            print("Invalid address: {}", addrStr);
             return true;
         }
 
@@ -592,11 +599,11 @@ private:
                 HRESULT hr = m_debugControl->RemoveBreakpoint(*it);
                 if (SUCCEEDED(hr))
                 {
-                    printf("Breakpoint removed at 0x%016llx\n", address);
+                    print("Breakpoint removed at {:#x}", address);
                 }
                 else
                 {
-                    printf("Failed to remove breakpoint: 0x%08x\n", hr);
+                    print("Failed to remove breakpoint: {:#x}", (uint32_t)hr);
                 }
                 (*it)->Release();
                 m_breakpoints.erase(it);
@@ -604,7 +611,7 @@ private:
             }
         }
 
-        printf("No breakpoint found at 0x%016llx\n", address);
+        print("No breakpoint found at {:#x}", address);
         return true;
     }
 
@@ -612,14 +619,14 @@ private:
     {
         if (!m_processRunning)
         {
-            printf("No process running\n");
+            print("No process running");
             return true;
         }
 
         HRESULT hr = m_debugControl->SetExecutionStatus(DEBUG_STATUS_STEP_OVER);
         if (FAILED(hr))
         {
-            printf("Failed to step over: 0x%08x\n", hr);
+            print("Failed to step over: {:#x}", (uint32_t)hr);
             return true;
         }
 
@@ -627,7 +634,7 @@ private:
         hr = m_debugControl->WaitForEvent(DEBUG_WAIT_DEFAULT, INFINITE);
         if (FAILED(hr))
         {
-            printf("WaitForEvent failed: 0x%08x\n", hr);
+            print("WaitForEvent failed: {:#x}", (uint32_t)hr);
         }
 
         return true;
@@ -637,14 +644,14 @@ private:
     {
         if (!m_processRunning)
         {
-            printf("No process running\n");
+            print("No process running");
             return true;
         }
 
         HRESULT hr = m_debugControl->SetExecutionStatus(DEBUG_STATUS_STEP_INTO);
         if (FAILED(hr))
         {
-            printf("Failed to step into: 0x%08x\n", hr);
+            print("Failed to step into: {:#x}", (uint32_t)hr);
             return true;
         }
 
@@ -652,7 +659,7 @@ private:
         hr = m_debugControl->WaitForEvent(DEBUG_WAIT_DEFAULT, INFINITE);
         if (FAILED(hr))
         {
-            printf("WaitForEvent failed: 0x%08x\n", hr);
+            print("WaitForEvent failed: {:#x}", (uint32_t)hr);
         }
 
         return true;
@@ -662,7 +669,7 @@ private:
     {
         if (!m_processRunning)
         {
-            printf("No process running\n");
+            print("No process running");
             return true;
         }
 
@@ -670,11 +677,11 @@ private:
         HRESULT hr = m_debugRegisters->GetNumberRegisters(&numRegs);
         if (FAILED(hr))
         {
-            printf("Failed to get register count: 0x%08x\n", hr);
+            print("Failed to get register count: {:#x}", (uint32_t)hr);
             return true;
         }
 
-        printf("Registers:\n");
+        print("Registers:");
 
         // Common x64 registers to display
         const char* commonRegs[] = {
@@ -691,7 +698,7 @@ private:
                 hr = m_debugRegisters->GetValue(regIndex, &regValue);
                 if (SUCCEEDED(hr))
                 {
-                    printf("%-3s = 0x%016llx\n", regName, regValue.I64);
+                    print("{:<3} = {:#x}", regName, regValue.I64);
                 }
             }
         }
@@ -703,21 +710,21 @@ private:
     {
         if (!m_processRunning)
         {
-            printf("No process running\n");
+            print("No process running");
             return true;
         }
 
         ULONG64 address = ParseAddress(addrStr);
         if (address == 0)
         {
-            printf("Invalid address: %s\n", addrStr.c_str());
+            print("Invalid address: {}", addrStr);
             return true;
         }
 
         ULONG size = static_cast<ULONG>(std::stoul(sizeStr, nullptr, 0));
         if (size == 0 || size > 1024)
         {
-            printf("Invalid size: %s (must be 1-1024)\n", sizeStr.c_str());
+            print("Invalid size: {} (must be 1-1024)", sizeStr);
             return true;
         }
 
@@ -727,22 +734,22 @@ private:
         HRESULT hr = m_debugDataSpaces->ReadVirtual(address, buffer.data(), size, &bytesRead);
         if (FAILED(hr))
         {
-            printf("Failed to read memory: 0x%08x\n", hr);
+            print("Failed to read memory: {:#x}", (uint32_t)hr);
             return true;
         }
 
         // Display memory in hex format, 16 bytes per row
         for (ULONG i = 0; i < bytesRead; i += 16)
         {
-            printf("%016llx: ", address + i);
+            std::string hexLine = std::format("{:016x}: ", address + i);
 
             // Print hex bytes
             for (ULONG j = 0; j < 16 && (i + j) < bytesRead; j++)
             {
-                printf("%02x ", buffer[i + j]);
+                hexLine += std::format("{:02x} ", buffer[i + j]);
             }
 
-            printf("\n");
+            print("{}", hexLine);
         }
 
         return true;
@@ -769,16 +776,16 @@ private:
 
     void ShowHelp()
     {
-        printf("Available commands:\n");
-        printf("  run, r          - Resume execution\n");
-        printf("  bp 0xaddr       - Set breakpoint at address\n");
-        printf("  bc 0xaddr       - Clear breakpoint at address\n");
-        printf("  sto             - Step over (instruction)\n");
-        printf("  sti             - Step into (instruction)\n");
-        printf("  regs            - Show registers\n");
-        printf("  read 0xaddr size - Read memory at address\n");
-        printf("  help, h         - Show this help\n");
-        printf("  quit, q         - Exit debugger\n");
+        print("Available commands:");
+        print("  run, r          - Resume execution");
+        print("  bp 0xaddr       - Set breakpoint at address");
+        print("  bc 0xaddr       - Clear breakpoint at address");
+        print("  sto             - Step over (instruction)");
+        print("  sti             - Step into (instruction)");
+        print("  regs            - Show registers");
+        print("  read 0xaddr size - Read memory at address");
+        print("  help, h         - Show this help");
+        print("  quit, q         - Exit debugger");
     }
 
     void Cleanup()
@@ -861,7 +868,7 @@ public:
             }
             else
             {
-                printf("Process terminated. Type 'quit' to exit.\n");
+                puts("Process terminated. Type 'quit' to exit.");
                 printf("(dbg) ");
             }
         }
@@ -872,8 +879,8 @@ int main(int argc, char** argv)
 {
     if (argc != 2)
     {
-        printf("Usage: %s <executable_path>\n", argv[0]);
-        printf("Example: %s build\\testapp.exe\n", argv[0]);
+        puts(std::format("Usage: {} <executable_path>", argv[0]).c_str());
+        print("Example: {} build\\testapp.exe", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -881,17 +888,17 @@ int main(int argc, char** argv)
 
     if (!debugger.Initialize())
     {
-        printf("Failed to initialize debugger\n");
+        print("Failed to initialize debugger");
         return EXIT_FAILURE;
     }
 
     if (!debugger.LaunchProcess(argv[1]))
     {
-        printf("Failed to launch process: %s\n", argv[1]);
+        print("Failed to launch process: {}", argv[1]);
         return EXIT_FAILURE;
     }
 
-    printf("Type 'help' for available commands.\n");
+    print("Type 'help' for available commands.");
     debugger.RunCommandLoop();
 
     return EXIT_SUCCESS;
