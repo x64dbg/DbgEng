@@ -39,14 +39,16 @@ private:
     ULONG m_refCount;
 
 public:
-    DebugEventCallbacks(SimpleDebugger* debugger) : m_debugger(debugger), m_refCount(1) {}
+    DebugEventCallbacks(SimpleDebugger* debugger)
+        : m_debugger(debugger), m_refCount(1) {}
 
     // IUnknown methods
     STDMETHOD_(ULONG, AddRef)() override { return InterlockedIncrement(&m_refCount); }
-    STDMETHOD_(ULONG, Release)() override 
-    { 
+    STDMETHOD_(ULONG, Release)() override
+    {
         ULONG count = InterlockedDecrement(&m_refCount);
-        if (count == 0) delete this;
+        if (count == 0)
+            delete this;
         return count;
     }
     STDMETHOD(QueryInterface)(REFIID riid, void** ppvObject) override
@@ -100,24 +102,26 @@ public:
             printf("Access violation at 0x%016llx\n", Exception->ExceptionAddress);
             return DEBUG_STATUS_BREAK;
         }
-        
+
         return FirstChance ? DEBUG_STATUS_NO_CHANGE : DEBUG_STATUS_BREAK;
     }
 
     STDMETHOD(CreateThread)(ULONG64 Handle, ULONG64 DataOffset, ULONG64 StartOffset) override
     {
+        printf("Thread created - Handle: 0x%016llx, DataOffset: 0x%016llx, StartOffset: 0x%016llx\n",
+            Handle,
+            DataOffset,
+            StartOffset);
         return DEBUG_STATUS_NO_CHANGE;
     }
 
     STDMETHOD(ExitThread)(ULONG ExitCode) override
     {
+        printf("Thread exited with code: %lu (0x%08x)\n", ExitCode, ExitCode);
         return DEBUG_STATUS_NO_CHANGE;
     }
 
-    STDMETHOD(CreateProcess)(ULONG64 ImageFileHandle, ULONG64 Handle, ULONG64 BaseOffset,
-                           ULONG ModuleSize, PCSTR ModuleName, PCSTR ImageName,
-                           ULONG CheckSum, ULONG TimeDateStamp, ULONG64 InitialThreadHandle,
-                           ULONG64 ThreadDataOffset, ULONG64 StartOffset) override
+    STDMETHOD(CreateProcess)(ULONG64 ImageFileHandle, ULONG64 Handle, ULONG64 BaseOffset, ULONG ModuleSize, PCSTR ModuleName, PCSTR ImageName, ULONG CheckSum, ULONG TimeDateStamp, ULONG64 InitialThreadHandle, ULONG64 ThreadDataOffset, ULONG64 StartOffset) override
     {
         printf("Process created: %s (base: 0x%016llx)\n", ImageName ? ImageName : "Unknown", BaseOffset);
         return DEBUG_STATUS_NO_CHANGE;
@@ -129,39 +133,149 @@ public:
         return DEBUG_STATUS_NO_CHANGE;
     }
 
-    STDMETHOD(LoadModule)(ULONG64 ImageFileHandle, ULONG64 BaseOffset, ULONG ModuleSize,
-                         PCSTR ModuleName, PCSTR ImageName, ULONG CheckSum, ULONG TimeDateStamp) override
+    STDMETHOD(LoadModule)(ULONG64 ImageFileHandle, ULONG64 BaseOffset, ULONG ModuleSize, PCSTR ModuleName, PCSTR ImageName, ULONG CheckSum, ULONG TimeDateStamp) override
     {
+        printf("Module loaded: %s (%s) - Base: 0x%016llx, Size: 0x%08x, Checksum: 0x%08x, Timestamp: 0x%08x\n",
+            ImageName ? ImageName : "Unknown",
+            ModuleName ? ModuleName : "Unknown",
+            BaseOffset,
+            ModuleSize,
+            CheckSum,
+            TimeDateStamp);
         return DEBUG_STATUS_NO_CHANGE;
     }
 
     STDMETHOD(UnloadModule)(PCSTR ImageBaseName, ULONG64 BaseOffset) override
     {
+        printf("Module unloaded: %s - Base: 0x%016llx\n",
+            ImageBaseName ? ImageBaseName : "Unknown",
+            BaseOffset);
         return DEBUG_STATUS_NO_CHANGE;
     }
 
     STDMETHOD(SystemError)(ULONG Error, ULONG Level) override
     {
+        printf("System error occurred - Error: %lu (0x%08x), Level: %lu\n",
+            Error,
+            Error,
+            Level);
         return DEBUG_STATUS_NO_CHANGE;
     }
 
     STDMETHOD(SessionStatus)(ULONG Status) override
     {
+        const char* statusStr = "Unknown";
+        switch (Status)
+        {
+        case DEBUG_SESSION_ACTIVE:
+            statusStr = "Active";
+            break;
+        case DEBUG_SESSION_END_SESSION_ACTIVE_TERMINATE:
+            statusStr = "End Session Active Terminate";
+            break;
+        case DEBUG_SESSION_END_SESSION_ACTIVE_DETACH:
+            statusStr = "End Session Active Detach";
+            break;
+        case DEBUG_SESSION_END_SESSION_PASSIVE:
+            statusStr = "End Session Passive";
+            break;
+        case DEBUG_SESSION_END:
+            statusStr = "End";
+            break;
+        case DEBUG_SESSION_REBOOT:
+            statusStr = "Reboot";
+            break;
+        case DEBUG_SESSION_HIBERNATE:
+            statusStr = "Hibernate";
+            break;
+        case DEBUG_SESSION_FAILURE:
+            statusStr = "Failure";
+            break;
+        }
+        printf("Session status changed: %s (%lu)\n", statusStr, Status);
         return S_OK;
     }
 
     STDMETHOD(ChangeDebuggeeState)(ULONG Flags, ULONG64 Argument) override
     {
+        printf("Debuggee state changed - Flags: 0x%08x, Argument: 0x%016llx\n",
+            Flags,
+            Argument);
+
+        // Decode common flags for better understanding
+        if (Flags & DEBUG_CDS_REGISTERS)
+            printf("  - Registers changed\n");
+        if (Flags & DEBUG_CDS_DATA)
+            printf("  - Data/memory changed\n");
+        if (Flags & DEBUG_CDS_REFRESH)
+            printf("  - Refresh requested\n");
+
         return DEBUG_STATUS_NO_CHANGE;
     }
 
     STDMETHOD(ChangeEngineState)(ULONG Flags, ULONG64 Argument) override
     {
+        printf("Engine state changed - Flags: 0x%08x, Argument: 0x%016llx\n",
+            Flags,
+            Argument);
+
+        // Decode common flags for better understanding
+        if (Flags & DEBUG_CES_CURRENT_THREAD)
+            printf("  - Current thread changed\n");
+        if (Flags & DEBUG_CES_EFFECTIVE_PROCESSOR)
+            printf("  - Effective processor changed\n");
+        if (Flags & DEBUG_CES_BREAKPOINTS)
+            printf("  - Breakpoints changed\n");
+        if (Flags & DEBUG_CES_CODE_LEVEL)
+            printf("  - Code level changed\n");
+        if (Flags & DEBUG_CES_EXECUTION_STATUS)
+            printf("  - Execution status changed\n");
+        if (Flags & DEBUG_CES_ENGINE_OPTIONS)
+            printf("  - Engine options changed\n");
+        if (Flags & DEBUG_CES_LOG_FILE)
+            printf("  - Log file changed\n");
+        if (Flags & DEBUG_CES_RADIX)
+            printf("  - Radix changed\n");
+        if (Flags & DEBUG_CES_EVENT_FILTERS)
+            printf("  - Event filters changed\n");
+        if (Flags & DEBUG_CES_PROCESS_OPTIONS)
+            printf("  - Process options changed\n");
+        if (Flags & DEBUG_CES_EXTENSIONS)
+            printf("  - Extensions changed\n");
+        if (Flags & DEBUG_CES_SYSTEMS)
+            printf("  - Systems changed\n");
+        if (Flags & DEBUG_CES_ASSEMBLY_OPTIONS)
+            printf("  - Assembly options changed\n");
+        if (Flags & DEBUG_CES_EXPRESSION_SYNTAX)
+            printf("  - Expression syntax changed\n");
+        if (Flags & DEBUG_CES_TEXT_REPLACEMENTS)
+            printf("  - Text replacements changed\n");
+
         return S_OK;
     }
 
     STDMETHOD(ChangeSymbolState)(ULONG Flags, ULONG64 Argument) override
     {
+        printf("Symbol state changed - Flags: 0x%08x, Argument: 0x%016llx\n",
+            Flags,
+            Argument);
+
+        // Decode common flags for better understanding
+        if (Flags & DEBUG_CSS_LOADS)
+            printf("  - Symbol loads changed\n");
+        if (Flags & DEBUG_CSS_UNLOADS)
+            printf("  - Symbol unloads changed\n");
+        if (Flags & DEBUG_CSS_SCOPE)
+            printf("  - Symbol scope changed\n");
+        if (Flags & DEBUG_CSS_PATHS)
+            printf("  - Symbol paths changed\n");
+        if (Flags & DEBUG_CSS_SYMBOL_OPTIONS)
+            printf("  - Symbol options changed\n");
+        if (Flags & DEBUG_CSS_TYPE_OPTIONS)
+            printf("  - Type options changed\n");
+        if (Flags & DEBUG_CSS_COLLAPSE_CHILDREN)
+            printf("  - Collapse children changed\n");
+
         return DEBUG_STATUS_NO_CHANGE;
     }
 };
@@ -176,17 +290,15 @@ private:
     IDebugRegisters* m_debugRegisters;
     IDebugSymbols* m_debugSymbols;
     IDebugSystemObjects* m_debugSystemObjects;
-    
+
     DebugEventCallbacks* m_eventCallbacks;
     std::vector<IDebugBreakpoint*> m_breakpoints;
     bool m_debugActive;
     bool m_processRunning;
 
 public:
-    SimpleDebugger() : m_debugClient(nullptr), m_debugControl(nullptr), 
-                      m_debugDataSpaces(nullptr), m_debugRegisters(nullptr),
-                      m_debugSymbols(nullptr), m_debugSystemObjects(nullptr),
-                      m_eventCallbacks(nullptr), m_debugActive(false), m_processRunning(false)
+    SimpleDebugger()
+        : m_debugClient(nullptr), m_debugControl(nullptr), m_debugDataSpaces(nullptr), m_debugRegisters(nullptr), m_debugSymbols(nullptr), m_debugSystemObjects(nullptr), m_eventCallbacks(nullptr), m_debugActive(false), m_processRunning(false)
     {
     }
 
@@ -273,8 +385,7 @@ public:
             return false;
         }
 
-        HRESULT hr = m_debugClient->CreateProcess(0, const_cast<char*>(executablePath), 
-                                                 DEBUG_ONLY_THIS_PROCESS);
+        HRESULT hr = m_debugClient->CreateProcess(0, const_cast<char*>(executablePath), DEBUG_ONLY_THIS_PROCESS);
         if (FAILED(hr))
         {
             printf("Failed to create process: 0x%08x\n", hr);
@@ -288,7 +399,6 @@ public:
             printf("Failed to wait for initial event: 0x%08x\n", hr);
             return false;
         }
-
 
         m_processRunning = true;
         printf("Debugger started. Process created.\n");
@@ -371,7 +481,7 @@ private:
         }
 
         printf("Running...\n");
-        
+
         // Wait for next event
         hr = m_debugControl->WaitForEvent(DEBUG_WAIT_DEFAULT, INFINITE);
         if (FAILED(hr))
@@ -535,11 +645,10 @@ private:
         }
 
         printf("Registers:\n");
-        
+
         // Common x64 registers to display
         const char* commonRegs[] = {
-            "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
-            "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip"
+            "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip"
         };
 
         for (const char* regName : commonRegs)
@@ -584,7 +693,7 @@ private:
 
         std::vector<UCHAR> buffer(size);
         ULONG bytesRead;
-        
+
         HRESULT hr = m_debugDataSpaces->ReadVirtual(address, buffer.data(), size, &bytesRead);
         if (FAILED(hr))
         {
@@ -596,13 +705,13 @@ private:
         for (ULONG i = 0; i < bytesRead; i += 16)
         {
             printf("%016llx: ", address + i);
-            
+
             // Print hex bytes
             for (ULONG j = 0; j < 16 && (i + j) < bytesRead; j++)
             {
                 printf("%02x ", buffer[i + j]);
             }
-            
+
             printf("\n");
         }
 
@@ -647,7 +756,8 @@ private:
         // Clean up breakpoints
         for (auto bp : m_breakpoints)
         {
-            if (bp) bp->Release();
+            if (bp)
+                bp->Release();
         }
         m_breakpoints.clear();
 
@@ -658,14 +768,42 @@ private:
         }
 
         // Release interfaces in reverse order
-        if (m_debugSystemObjects) { m_debugSystemObjects->Release(); m_debugSystemObjects = nullptr; }
-        if (m_debugSymbols) { m_debugSymbols->Release(); m_debugSymbols = nullptr; }
-        if (m_debugRegisters) { m_debugRegisters->Release(); m_debugRegisters = nullptr; }
-        if (m_debugDataSpaces) { m_debugDataSpaces->Release(); m_debugDataSpaces = nullptr; }
-        if (m_debugControl) { m_debugControl->Release(); m_debugControl = nullptr; }
-        if (m_debugClient) { m_debugClient->Release(); m_debugClient = nullptr; }
-        
-        if (m_eventCallbacks) { m_eventCallbacks->Release(); m_eventCallbacks = nullptr; }
+        if (m_debugSystemObjects)
+        {
+            m_debugSystemObjects->Release();
+            m_debugSystemObjects = nullptr;
+        }
+        if (m_debugSymbols)
+        {
+            m_debugSymbols->Release();
+            m_debugSymbols = nullptr;
+        }
+        if (m_debugRegisters)
+        {
+            m_debugRegisters->Release();
+            m_debugRegisters = nullptr;
+        }
+        if (m_debugDataSpaces)
+        {
+            m_debugDataSpaces->Release();
+            m_debugDataSpaces = nullptr;
+        }
+        if (m_debugControl)
+        {
+            m_debugControl->Release();
+            m_debugControl = nullptr;
+        }
+        if (m_debugClient)
+        {
+            m_debugClient->Release();
+            m_debugClient = nullptr;
+        }
+
+        if (m_eventCallbacks)
+        {
+            m_eventCallbacks->Release();
+            m_eventCallbacks = nullptr;
+        }
 
         m_debugActive = false;
         m_processRunning = false;
@@ -676,7 +814,7 @@ public:
     {
         std::string command;
         printf("(dbg) ");
-        
+
         while (std::getline(std::cin, command))
         {
             if (!command.empty())
@@ -686,7 +824,7 @@ public:
                     break; // Exit requested
                 }
             }
-            
+
             if (m_processRunning)
             {
                 printf("(dbg) ");
@@ -710,7 +848,7 @@ int main(int argc, char** argv)
     }
 
     SimpleDebugger debugger;
-    
+
     if (!debugger.Initialize())
     {
         printf("Failed to initialize debugger\n");
