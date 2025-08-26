@@ -36,7 +36,7 @@ project(x64dbg-dbgeng)
 # Target: playground
 set(playground_SOURCES
 	cmake.toml
-	"src/playground.cpp"
+	"src/playground/playground.cpp"
 )
 
 add_executable(playground)
@@ -62,4 +62,77 @@ endif()
 get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
 if(NOT CMKR_VS_STARTUP_PROJECT)
 	set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT playground)
+endif()
+
+# Target: testlib
+set(testlib_SOURCES
+	cmake.toml
+	"src/testlib/testlib.cpp"
+)
+
+add_library(testlib SHARED)
+
+target_sources(testlib PRIVATE ${testlib_SOURCES})
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${testlib_SOURCES})
+
+if(MSVC) # msvc
+	target_link_options(testlib PUBLIC
+		"/INCREMENTAL:NO"
+		"/DYNAMICBASE:NO"
+	)
+endif()
+
+# Target: testapp
+set(testapp_SOURCES
+	cmake.toml
+	"src/testapp/debug.h"
+	"src/testapp/testapp.cpp"
+)
+
+add_executable(testapp)
+
+target_sources(testapp PRIVATE ${testapp_SOURCES})
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${testapp_SOURCES})
+
+if(NOT TARGET testlib)
+	message(FATAL_ERROR "Target \"testlib\" referenced by \"testapp\" does not exist!")
+endif()
+
+target_link_libraries(testapp PRIVATE
+	testlib
+)
+
+if(MSVC) # msvc
+	target_link_options(testapp PRIVATE
+		"/INCREMENTAL:NO"
+		"/DYNAMICBASE:NO"
+	)
+endif()
+
+get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+if(NOT CMKR_VS_STARTUP_PROJECT)
+	set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT testapp)
+endif()
+
+# Target: exception
+set(exception_SOURCES
+	cmake.toml
+	"src/exception/exception.cpp"
+)
+
+add_executable(exception)
+
+target_sources(exception PRIVATE ${exception_SOURCES})
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${exception_SOURCES})
+
+if(MSVC) # msvc
+	target_link_options(exception PRIVATE
+		"/INCREMENTAL:NO"
+		"/DYNAMICBASE:NO"
+	)
+endif()
+
+get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+if(NOT CMKR_VS_STARTUP_PROJECT)
+	set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT exception)
 endif()

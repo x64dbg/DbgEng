@@ -5,7 +5,23 @@ msvc-runtime = "static"
 
 [target.playground]
 type = "executable"
-sources = ["src/playground.cpp"]
+sources = ["src/playground/playground.cpp"]
 compile-features = ["cxx_std_20"]
 link-libraries = ["DbgEng", "Delayimp"]
 msvc.link-options = ["/DELAYLOAD:dbgeng.dll"]
+
+[target.testlib]
+type = "shared"
+sources = ["src/testlib/testlib.cpp"]
+msvc.link-options = ["/INCREMENTAL:NO", "/DYNAMICBASE:NO"]
+
+[target.testapp]
+type = "executable"
+sources = ["src/testapp/testapp.cpp", "src/testapp/debug.h"]
+msvc.link-options = ["/INCREMENTAL:NO", "/DYNAMICBASE:NO"]
+link-libraries = ["::testlib"]
+
+[target.exception]
+type = "executable"
+sources = ["src/exception/exception.cpp"]
+msvc.link-options = ["/INCREMENTAL:NO", "/DYNAMICBASE:NO"]
