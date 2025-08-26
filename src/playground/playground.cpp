@@ -32,7 +32,7 @@ const PfnDliHook __pfnDliNotifyHook2 = delayHook;
 class SimpleDebugger;
 
 // Event callback class
-class DebugEventCallbacks : public IDebugEventCallbacks
+class DebugEventCallbacks : public IDebugEventCallbacksWide
 {
 private:
     SimpleDebugger* m_debugger;
@@ -53,7 +53,7 @@ public:
     }
     STDMETHOD(QueryInterface)(REFIID riid, void** ppvObject) override
     {
-        if (riid == __uuidof(IUnknown) || riid == __uuidof(IDebugEventCallbacks))
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IDebugEventCallbacksWide))
         {
             *ppvObject = this;
             AddRef();
@@ -75,7 +75,7 @@ public:
         return S_OK;
     }
 
-    STDMETHOD(Breakpoint)(PDEBUG_BREAKPOINT Bp) override
+    STDMETHOD(Breakpoint)(PDEBUG_BREAKPOINT2 Bp) override
     {
         ULONG64 offset;
         if (SUCCEEDED(Bp->GetOffset(&offset)))
@@ -121,9 +121,9 @@ public:
         return DEBUG_STATUS_NO_CHANGE;
     }
 
-    STDMETHOD(CreateProcess)(ULONG64 ImageFileHandle, ULONG64 Handle, ULONG64 BaseOffset, ULONG ModuleSize, PCSTR ModuleName, PCSTR ImageName, ULONG CheckSum, ULONG TimeDateStamp, ULONG64 InitialThreadHandle, ULONG64 ThreadDataOffset, ULONG64 StartOffset) override
+    STDMETHOD(CreateProcess)(ULONG64 ImageFileHandle, ULONG64 Handle, ULONG64 BaseOffset, ULONG ModuleSize, PCWSTR ModuleName, PCWSTR ImageName, ULONG CheckSum, ULONG TimeDateStamp, ULONG64 InitialThreadHandle, ULONG64 ThreadDataOffset, ULONG64 StartOffset) override
     {
-        printf("Process created: %s (base: 0x%016llx)\n", ImageName ? ImageName : "Unknown", BaseOffset);
+        wprintf(L"Process created: %ls (base: 0x%016llx)\n", ImageName ? ImageName : L"Unknown", BaseOffset);
         return DEBUG_STATUS_NO_CHANGE;
     }
 
@@ -133,11 +133,11 @@ public:
         return DEBUG_STATUS_NO_CHANGE;
     }
 
-    STDMETHOD(LoadModule)(ULONG64 ImageFileHandle, ULONG64 BaseOffset, ULONG ModuleSize, PCSTR ModuleName, PCSTR ImageName, ULONG CheckSum, ULONG TimeDateStamp) override
+    STDMETHOD(LoadModule)(ULONG64 ImageFileHandle, ULONG64 BaseOffset, ULONG ModuleSize, PCWSTR ModuleName, PCWSTR ImageName, ULONG CheckSum, ULONG TimeDateStamp) override
     {
-        printf("Module loaded: %s (%s) - Base: 0x%016llx, Size: 0x%08x, Checksum: 0x%08x, Timestamp: 0x%08x\n",
-            ImageName ? ImageName : "Unknown",
-            ModuleName ? ModuleName : "Unknown",
+        wprintf(L"Module loaded: %ls (%ls) - Base: 0x%016llx, Size: 0x%08x, Checksum: 0x%08x, Timestamp: 0x%08x\n",
+            ImageName ? ImageName : L"Unknown",
+            ModuleName ? ModuleName : L"Unknown",
             BaseOffset,
             ModuleSize,
             CheckSum,
@@ -145,10 +145,10 @@ public:
         return DEBUG_STATUS_NO_CHANGE;
     }
 
-    STDMETHOD(UnloadModule)(PCSTR ImageBaseName, ULONG64 BaseOffset) override
+    STDMETHOD(UnloadModule)(PCWSTR ImageBaseName, ULONG64 BaseOffset) override
     {
-        printf("Module unloaded: %s - Base: 0x%016llx\n",
-            ImageBaseName ? ImageBaseName : "Unknown",
+        wprintf(L"Module unloaded: %ls - Base: 0x%016llx\n",
+            ImageBaseName ? ImageBaseName : L"Unknown",
             BaseOffset);
         return DEBUG_STATUS_NO_CHANGE;
     }
@@ -203,12 +203,24 @@ public:
             Argument);
 
         // Decode common flags for better understanding
-        if (Flags & DEBUG_CDS_REGISTERS)
+        switch (Flags)
+        {
+        case DEBUG_CDS_ALL:
+            printf("  - A general change in the target has occurred.\n");
+            break;
+        case DEBUG_CDS_REGISTERS:
             printf("  - Registers changed\n");
-        if (Flags & DEBUG_CDS_DATA)
+            break;
+        case DEBUG_CDS_DATA:
             printf("  - Data/memory changed\n");
-        if (Flags & DEBUG_CDS_REFRESH)
+            break;
+        case DEBUG_CDS_REFRESH:
             printf("  - Refresh requested\n");
+            break;
+        default:
+            printf("  - Unknown change\n");
+            break;
+        }
 
         return DEBUG_STATUS_NO_CHANGE;
     }
@@ -358,7 +370,7 @@ public:
 
         // Set up event callbacks
         m_eventCallbacks = new DebugEventCallbacks(this);
-        hr = m_debugClient->SetEventCallbacks(m_eventCallbacks);
+        hr = m_debugClient->SetEventCallbacksWide(m_eventCallbacks);
         if (FAILED(hr))
         {
             printf("Failed to set event callbacks: 0x%08x\n", hr);
@@ -366,7 +378,7 @@ public:
         }
 
         // Set engine options for initial break
-        hr = m_debugControl->SetEngineOptions(DEBUG_ENGOPT_INITIAL_BREAK);
+        hr = m_debugControl->SetEngineOptions(DEBUG_ENGOPT_INITIAL_BREAK | DEBUG_ENGOPT_DISABLE_MODULE_SYMBOL_LOAD);
         if (FAILED(hr))
         {
             printf("Failed to set engine options: 0x%08x\n", hr);
