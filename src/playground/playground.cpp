@@ -35,7 +35,7 @@ void logDebug(const std::format_string<Args...> fmt, Args&&... args)
     printf("[debug] %s\n", std::format(fmt, std::forward<Args>(args)...).c_str());
 }
 
-template<class...Args>
+template<class... Args>
 void print(const std::format_string<Args...> fmt, Args&&... args)
 {
     puts(std::format(fmt, std::forward<Args>(args)...).c_str());
@@ -50,6 +50,125 @@ std::string Utf16ToUtf8(const wchar_t* wstr)
     WideCharToMultiByte(CP_UTF8, 0, wstr, -1, &utf8[0], requiredSize, 0, 0);
     return utf8;
 }
+
+#define FLAG(name, description) { name, #name, description }
+
+struct FlagInfo
+{
+    uint32_t value;
+    const char* name;
+    const char* description;
+
+    bool operator==(const uint32_t other) const
+    {
+        return value == other;
+    }
+};
+
+static FlagInfo cesFlags[] = {
+    FLAG(DEBUG_CES_CURRENT_THREAD, "Current thread changed"),
+    FLAG(DEBUG_CES_EFFECTIVE_PROCESSOR, "Effective processor changed"),
+    FLAG(DEBUG_CES_BREAKPOINTS, "Breakpoints changed"),
+    FLAG(DEBUG_CES_CODE_LEVEL, "Code level changed"),
+    FLAG(DEBUG_CES_EXECUTION_STATUS, "Execution status changed"),
+    FLAG(DEBUG_CES_ENGINE_OPTIONS, "Engine options changed"),
+    FLAG(DEBUG_CES_LOG_FILE, "Log file changed"),
+    FLAG(DEBUG_CES_RADIX, "Radix changed"),
+    FLAG(DEBUG_CES_EVENT_FILTERS, "Event filters changed"),
+    FLAG(DEBUG_CES_PROCESS_OPTIONS, "Process options changed"),
+    FLAG(DEBUG_CES_EXTENSIONS, "Extensions changed"),
+    FLAG(DEBUG_CES_SYSTEMS, "Systems changed"),
+    FLAG(DEBUG_CES_ASSEMBLY_OPTIONS, "Assembly options changed"),
+    FLAG(DEBUG_CES_EXPRESSION_SYNTAX, "Expression syntax changed"),
+    FLAG(DEBUG_CES_TEXT_REPLACEMENTS, "Text replacements changed"),
+};
+
+static FlagInfo sessionFlags[] = {
+    FLAG(DEBUG_SESSION_ACTIVE, "Active"),
+    FLAG(DEBUG_SESSION_END_SESSION_ACTIVE_TERMINATE, "End Session Active Terminate"),
+    FLAG(DEBUG_SESSION_END_SESSION_ACTIVE_DETACH, "End Session Active Detach"),
+    FLAG(DEBUG_SESSION_END_SESSION_PASSIVE, "End Session Passive"),
+    FLAG(DEBUG_SESSION_END, "End"),
+    FLAG(DEBUG_SESSION_REBOOT, "Reboot"),
+    FLAG(DEBUG_SESSION_HIBERNATE, "Hibernate"),
+    FLAG(DEBUG_SESSION_FAILURE, "Failure"),
+};
+
+static FlagInfo cdsFlags[] = {
+    FLAG(DEBUG_CDS_ALL, "A general change in the target has occurred."),
+    FLAG(DEBUG_CDS_REGISTERS, "Registers changed"),
+    FLAG(DEBUG_CDS_DATA, "Data/memory changed"),
+    FLAG(DEBUG_CDS_REFRESH, "Refresh requested"),
+};
+
+static FlagInfo cssFlags[] = {
+    FLAG(DEBUG_CSS_LOADS, "Symbol loads changed"),
+    FLAG(DEBUG_CSS_UNLOADS, "Symbol unloads changed"),
+    FLAG(DEBUG_CSS_SCOPE, "Symbol scope changed"),
+    FLAG(DEBUG_CSS_PATHS, "Symbol paths changed"),
+    FLAG(DEBUG_CSS_SYMBOL_OPTIONS, "Symbol options changed"),
+    FLAG(DEBUG_CSS_TYPE_OPTIONS, "Type options changed"),
+    FLAG(DEBUG_CSS_COLLAPSE_CHILDREN, "Collapse children changed"),
+};
+
+static FlagInfo statusFlags[] = {
+    FLAG(DEBUG_STATUS_NO_CHANGE, ""),
+    FLAG(DEBUG_STATUS_GO, "Target is executing normally"),
+    FLAG(DEBUG_STATUS_GO_HANDLED, ""),
+    FLAG(DEBUG_STATUS_GO_NOT_HANDLED, ""),
+    FLAG(DEBUG_STATUS_STEP_OVER, "Target is executing a single instruction or call"),
+    FLAG(DEBUG_STATUS_STEP_INTO, "Target is executing a single instruction"),
+    FLAG(DEBUG_STATUS_BREAK, "Target is suspended"),
+    FLAG(DEBUG_STATUS_NO_DEBUGGEE, "No debugging session is active"),
+    FLAG(DEBUG_STATUS_STEP_BRANCH, "Target is executing until the next branch instruction"),
+    FLAG(DEBUG_STATUS_IGNORE_EVENT, ""),
+    FLAG(DEBUG_STATUS_RESTART_REQUESTED, "Target is restarting"),
+    FLAG(DEBUG_STATUS_REVERSE_GO, "Target is executing backwards"),
+    FLAG(DEBUG_STATUS_REVERSE_STEP_BRANCH, "Target is executing until the previous branch instruction"),
+    FLAG(DEBUG_STATUS_REVERSE_STEP_OVER, "Target is executing a single instruction or call backwards"),
+    FLAG(DEBUG_STATUS_REVERSE_STEP_INTO, "Target is executing a single instruction backwards"),
+    FLAG(DEBUG_STATUS_OUT_OF_SYNC, "Debugger communications channel is out of sync"),
+    FLAG(DEBUG_STATUS_WAIT_INPUT, "Target is awaiting input from the user"),
+    FLAG(DEBUG_STATUS_TIMEOUT, "Debugger communications channel has timed out"),
+};
+
+template<size_t N>
+static void logSingleFlag(const char* name, FlagInfo const (&flags)[N], uint32_t value)
+{
+    auto info = std::find(std::begin(flags), std::end(flags), value);
+    if (info == std::end(flags))
+    {
+        logDebug("  {}: {:#x} <unknown>", name, value);
+    }
+    else
+    {
+        logDebug("  {}: {} ({})", name, info->name, info->description);
+    }
+}
+
+template<size_t N>
+static void logBitFlag(const char* name, FlagInfo const (&flags)[N], uint32_t value)
+{
+    logDebug("  {}: {:#x}", name, value);
+    if (value == 0)
+    {
+        return;
+    }
+    for (const auto& flag : flags)
+    {
+        if (value & flag.value)
+        {
+            value &= ~flag.value;
+            logDebug("    {:#x} {} ({})", flag.value, flag.name, flag.description);
+        }
+    }
+    if (value != 0)
+    {
+        logDebug("    {:#x} <unknown>", value);
+    }
+}
+
+#undef FLAG
 
 // Forward declarations
 class SimpleDebugger;
@@ -100,31 +219,30 @@ public:
 
     STDMETHOD(Breakpoint)(PDEBUG_BREAKPOINT2 Bp) override
     {
-        ULONG64 offset;
-        if (SUCCEEDED(Bp->GetOffset(&offset)))
-        {
-            logDebug("Breakpoint hit at {:#x}", offset);
-        }
+        logDebug("[{}] Breakpoint hit", __func__);
+        ULONG64 offset = 0;
+        Bp->GetOffset(&offset);
+        logDebug("  Offset: {:#x}", offset);
+        ULONG breakType = 0;
+        ULONG procType = 0;
+        Bp->GetType(&breakType, &procType);
+        logDebug("  BreakType: {:#x}", breakType);
+        logDebug("  ProcType: {:#x}", procType);
         return DEBUG_STATUS_BREAK;
     }
 
     STDMETHOD(Exception)(PEXCEPTION_RECORD64 Exception, ULONG FirstChance) override
     {
-        if (Exception->ExceptionCode == STATUS_BREAKPOINT)
+        logDebug("[{}] Exception thrown", __func__);
+        logDebug("  FirstChance: {}", FirstChance);
+        logDebug("  ExceptionCode: {:#x}", Exception->ExceptionCode);
+        logDebug("  ExceptionFlags: {:#x}", Exception->ExceptionFlags);
+        logDebug("  ExceptionRecord: {:#x}", Exception->ExceptionRecord);
+        logDebug("  ExceptionAddress: {:#x}", Exception->ExceptionAddress);
+        logDebug("  NumberParameters: {:#x}", Exception->NumberParameters);
+        for (int i = 0; i < Exception->NumberParameters; i++)
         {
-            logDebug("Initial breakpoint hit at {:#x}", Exception->ExceptionAddress);
-        }
-        else if (Exception->ExceptionCode == STATUS_SINGLE_STEP)
-        {
-            logDebug("Single step completed at {:#x}", Exception->ExceptionAddress);
-        }
-        else if (Exception->ExceptionCode == STATUS_ACCESS_VIOLATION)
-        {
-            logDebug("Access violation at {:#x}", Exception->ExceptionAddress);
-        }
-        else
-        {
-            logDebug("Exception {:#x} at {:#x}", Exception->ExceptionCode, Exception->ExceptionAddress);
+            logDebug("    ExceptionInformation[{}]: {:#x}", i, Exception->ExceptionInformation[i]);
         }
 
         return DEBUG_STATUS_BREAK;
@@ -132,186 +250,115 @@ public:
 
     STDMETHOD(CreateThread)(ULONG64 Handle, ULONG64 DataOffset, ULONG64 StartOffset) override
     {
-        logDebug("Thread created - Handle: {:#x}, DataOffset: {:#x}, StartOffset: {:#x}",
-            Handle,
-            DataOffset,
-            StartOffset);
+        logDebug("[{}] Thread created", __func__);
+        logDebug("  Handle: {:#x}", Handle);
+        logDebug("  DataOffset: {:#x}", DataOffset);
+        logDebug("  StartOffset: {:#x}", StartOffset);
         return DEBUG_STATUS_NO_CHANGE;
     }
 
     STDMETHOD(ExitThread)(ULONG ExitCode) override
     {
-        logDebug("Thread exited with code: {} ({:#x})", ExitCode, ExitCode);
+        logDebug("[{}] Thread exited", __func__);
+        logDebug("  ExitCode: {:#x}", ExitCode);
         return DEBUG_STATUS_NO_CHANGE;
     }
 
     STDMETHOD(CreateProcess)(ULONG64 ImageFileHandle, ULONG64 Handle, ULONG64 BaseOffset, ULONG ModuleSize, PCWSTR ModuleName, PCWSTR ImageName, ULONG CheckSum, ULONG TimeDateStamp, ULONG64 InitialThreadHandle, ULONG64 ThreadDataOffset, ULONG64 StartOffset) override
     {
-        logDebug("Process created: {} (base: {:#x})",
-            ImageName ? Utf16ToUtf8(ImageName) : "Unknown", BaseOffset);
+        logDebug("[{}] Process created", __func__);
+        logDebug("  ImageFileHandle: {:#x}", ImageFileHandle);
+        logDebug("  Handle: {:#x}", Handle);
+        logDebug("  BaseOffset: {:#x}", BaseOffset);
+        logDebug("  ModuleSize: {:#x}", ModuleSize);
+        logDebug("  ModuleName: {}", ModuleName ? Utf16ToUtf8(ModuleName) : "<unknown>");
+        logDebug("  ImageName: {}", ImageName ? Utf16ToUtf8(ImageName) : "<unknown>");
+        logDebug("  CheckSum: {:#x}", CheckSum);
+        logDebug("  TimeDateStamp: {:#x}", TimeDateStamp);
+        logDebug("  InitialThreadHandle: {:#x}", InitialThreadHandle);
+        logDebug("  ThreadDataOffset: {:#x}", ThreadDataOffset);
+        logDebug("  StartOffset: {:#x}", StartOffset);
         return DEBUG_STATUS_NO_CHANGE;
     }
 
     STDMETHOD(ExitProcess)(ULONG ExitCode) override
     {
-        logDebug("Process exited with code: {}", ExitCode);
+        logDebug("[{}] Process exited", __func__);
+        logDebug("  ExitCode: {:#x}", ExitCode);
         return DEBUG_STATUS_NO_CHANGE;
     }
 
     STDMETHOD(LoadModule)(ULONG64 ImageFileHandle, ULONG64 BaseOffset, ULONG ModuleSize, PCWSTR ModuleName, PCWSTR ImageName, ULONG CheckSum, ULONG TimeDateStamp) override
     {
-        logDebug("Module loaded: {} ({}) - Base: {:#x}, Size: {:#x}, Checksum: {:#x}, Timestamp: {:#x}",
-            ImageName ? Utf16ToUtf8(ImageName) : "Unknown",
-            ModuleName ? Utf16ToUtf8(ModuleName) : "Unknown",
-            BaseOffset,
-            ModuleSize,
-            CheckSum,
-            TimeDateStamp);
+        logDebug("[{}] Module loaded", __func__);
+        logDebug("  ImageFileHandle: {:#x}", ImageFileHandle);
+        logDebug("  BaseOffset: {:#x}", BaseOffset);
+        logDebug("  ModuleSize: {:#x}", ModuleSize);
+        logDebug("  ModuleName: {}", ModuleName ? Utf16ToUtf8(ModuleName) : "<unknown>");
+        logDebug("  ImageName: {}", ImageName ? Utf16ToUtf8(ImageName) : "<unknown>");
+        logDebug("  CheckSum: {:#x}", CheckSum);
+        logDebug("  TimeDateStamp: {:#x}", TimeDateStamp);
         return DEBUG_STATUS_NO_CHANGE;
     }
 
     STDMETHOD(UnloadModule)(PCWSTR ImageBaseName, ULONG64 BaseOffset) override
     {
-        logDebug("Module unloaded: {} - Base: {:#x}",
-            ImageBaseName ? Utf16ToUtf8(ImageBaseName) : "Unknown",
-            BaseOffset);
+        logDebug("[{}] Module unloaded", __func__);
+        logDebug("  ImageBaseName: {}", ImageBaseName ? Utf16ToUtf8(ImageBaseName) : "<unknown>");
+        logDebug("  BaseOffset: {:#x}", BaseOffset);
         return DEBUG_STATUS_NO_CHANGE;
     }
 
     STDMETHOD(SystemError)(ULONG Error, ULONG Level) override
     {
-        logDebug("System error occurred - Error: {} ({:#x}), Level: {}",
-            Error,
-            Error,
-            Level);
+        logDebug("[{}] System error", __func__);
+        logDebug("  Error: {:#x}", Error);
+        logDebug("  Level: {:#x}", Level);
         return DEBUG_STATUS_NO_CHANGE;
     }
 
     STDMETHOD(SessionStatus)(ULONG Status) override
     {
-        const char* statusStr = "Unknown";
-        switch (Status)
-        {
-        case DEBUG_SESSION_ACTIVE:
-            statusStr = "Active";
-            break;
-        case DEBUG_SESSION_END_SESSION_ACTIVE_TERMINATE:
-            statusStr = "End Session Active Terminate";
-            break;
-        case DEBUG_SESSION_END_SESSION_ACTIVE_DETACH:
-            statusStr = "End Session Active Detach";
-            break;
-        case DEBUG_SESSION_END_SESSION_PASSIVE:
-            statusStr = "End Session Passive";
-            break;
-        case DEBUG_SESSION_END:
-            statusStr = "End";
-            break;
-        case DEBUG_SESSION_REBOOT:
-            statusStr = "Reboot";
-            break;
-        case DEBUG_SESSION_HIBERNATE:
-            statusStr = "Hibernate";
-            break;
-        case DEBUG_SESSION_FAILURE:
-            statusStr = "Failure";
-            break;
-        }
-        logDebug("Session status changed: {} ({})", statusStr, Status);
+        logDebug("[{}] Session status changed", __func__);
+        logSingleFlag("Status", sessionFlags, Status);
         return S_OK;
     }
 
     STDMETHOD(ChangeDebuggeeState)(ULONG Flags, ULONG64 Argument) override
     {
-        logDebug("Debuggee state changed - Flags: {:#x}, Argument: {:#x}",
-            Flags,
-            Argument);
-
-        // Decode common flags for better understanding
-        switch (Flags)
-        {
-        case DEBUG_CDS_ALL:
-            logDebug("  - A general change in the target has occurred.");
-            break;
-        case DEBUG_CDS_REGISTERS:
-            logDebug("  - Registers changed");
-            break;
-        case DEBUG_CDS_DATA:
-            logDebug("  - Data/memory changed");
-            break;
-        case DEBUG_CDS_REFRESH:
-            logDebug("  - Refresh requested");
-            break;
-        default:
-            logDebug("  - Unknown change");
-            break;
-        }
-
+        logDebug("[{}] Debuggee state changed", __func__);
+        logSingleFlag("Flags", cdsFlags, Flags);
+        logDebug("  Argument: {:#x}", Argument);
         return DEBUG_STATUS_NO_CHANGE;
     }
 
     STDMETHOD(ChangeEngineState)(ULONG Flags, ULONG64 Argument) override
     {
-        logDebug("Engine state changed - Flags: {:#x}, Argument: {:#x}",
-            Flags,
-            Argument);
-
-        // Decode common flags for better understanding
-        if (Flags & DEBUG_CES_CURRENT_THREAD)
-            logDebug("  - Current thread changed");
-        if (Flags & DEBUG_CES_EFFECTIVE_PROCESSOR)
-            logDebug("  - Effective processor changed");
-        if (Flags & DEBUG_CES_BREAKPOINTS)
-            logDebug("  - Breakpoints changed");
-        if (Flags & DEBUG_CES_CODE_LEVEL)
-            logDebug("  - Code level changed");
+        logDebug("[{}] Engine state changed", __func__);
+        logBitFlag("Flags", cesFlags, Flags);
+        logDebug("  Argument: {:#x}", Argument);
         if (Flags & DEBUG_CES_EXECUTION_STATUS)
-            logDebug("  - Execution status changed");
-        if (Flags & DEBUG_CES_ENGINE_OPTIONS)
-            logDebug("  - Engine options changed");
-        if (Flags & DEBUG_CES_LOG_FILE)
-            logDebug("  - Log file changed");
-        if (Flags & DEBUG_CES_RADIX)
-            logDebug("  - Radix changed");
-        if (Flags & DEBUG_CES_EVENT_FILTERS)
-            logDebug("  - Event filters changed");
-        if (Flags & DEBUG_CES_PROCESS_OPTIONS)
-            logDebug("  - Process options changed");
-        if (Flags & DEBUG_CES_EXTENSIONS)
-            logDebug("  - Extensions changed");
-        if (Flags & DEBUG_CES_SYSTEMS)
-            logDebug("  - Systems changed");
-        if (Flags & DEBUG_CES_ASSEMBLY_OPTIONS)
-            logDebug("  - Assembly options changed");
-        if (Flags & DEBUG_CES_EXPRESSION_SYNTAX)
-            logDebug("  - Expression syntax changed");
-        if (Flags & DEBUG_CES_TEXT_REPLACEMENTS)
-            logDebug("  - Text replacements changed");
-
+        {
+            if (Argument & DEBUG_STATUS_INSIDE_WAIT)
+            {
+                logDebug("  DEBUG_STATUS_INSIDE_WAIT");
+                Argument &= ~DEBUG_STATUS_INSIDE_WAIT;
+            }
+            if (Argument & DEBUG_STATUS_WAIT_TIMEOUT)
+            {
+                logDebug("  DEBUG_STATUS_WAIT_TIMEOUT");
+                Argument &= ~DEBUG_STATUS_WAIT_TIMEOUT;
+            }
+            logSingleFlag("Status", statusFlags, Argument);
+        }
         return S_OK;
     }
 
     STDMETHOD(ChangeSymbolState)(ULONG Flags, ULONG64 Argument) override
     {
-        logDebug("Symbol state changed - Flags: {:#x}, Argument: {:#x}",
-            Flags,
-            Argument);
-
-        // Decode common flags for better understanding
-        if (Flags & DEBUG_CSS_LOADS)
-            logDebug("  - Symbol loads changed");
-        if (Flags & DEBUG_CSS_UNLOADS)
-            logDebug("  - Symbol unloads changed");
-        if (Flags & DEBUG_CSS_SCOPE)
-            logDebug("  - Symbol scope changed");
-        if (Flags & DEBUG_CSS_PATHS)
-            logDebug("  - Symbol paths changed");
-        if (Flags & DEBUG_CSS_SYMBOL_OPTIONS)
-            logDebug("  - Symbol options changed");
-        if (Flags & DEBUG_CSS_TYPE_OPTIONS)
-            logDebug("  - Type options changed");
-        if (Flags & DEBUG_CSS_COLLAPSE_CHILDREN)
-            logDebug("  - Collapse children changed");
+        logDebug("[{}] Symbol state changed", __func__);
+        logBitFlag("Flags", cssFlags, Flags);
+        logDebug("  Argument: {:#x}", Argument);
 
         return DEBUG_STATUS_NO_CHANGE;
     }
@@ -321,23 +368,20 @@ public:
 class SimpleDebugger
 {
 private:
-    IDebugClient9* m_debugClient;
-    IDebugControl* m_debugControl;
-    IDebugDataSpaces* m_debugDataSpaces;
-    IDebugRegisters* m_debugRegisters;
-    IDebugSymbols* m_debugSymbols;
-    IDebugSystemObjects* m_debugSystemObjects;
+    IDebugClient9* m_debugClient = nullptr;
+    IDebugControl* m_debugControl = nullptr;
+    IDebugDataSpaces* m_debugDataSpaces = nullptr;
+    IDebugRegisters* m_debugRegisters = nullptr;
+    IDebugSymbols* m_debugSymbols = nullptr;
+    IDebugSystemObjects* m_debugSystemObjects = nullptr;
 
-    DebugEventCallbacks* m_eventCallbacks;
+    DebugEventCallbacks* m_eventCallbacks = nullptr;
     std::vector<IDebugBreakpoint*> m_breakpoints;
-    bool m_debugActive;
-    bool m_processRunning;
+    bool m_debugActive = false;
+    bool m_processRunning = false;
 
 public:
-    SimpleDebugger()
-        : m_debugClient(nullptr), m_debugControl(nullptr), m_debugDataSpaces(nullptr), m_debugRegisters(nullptr), m_debugSymbols(nullptr), m_debugSystemObjects(nullptr), m_eventCallbacks(nullptr), m_debugActive(false), m_processRunning(false)
-    {
-    }
+    SimpleDebugger() = default;
 
     ~SimpleDebugger()
     {
@@ -346,9 +390,6 @@ public:
 
     bool Initialize()
     {
-        // Load dbgeng.dll
-        LoadLibraryA("dbgeng.dll");
-
         // Create primary debug client interface
         HRESULT hr = DebugCreate(__uuidof(IDebugClient9), reinterpret_cast<void**>(&m_debugClient));
         if (FAILED(hr))
@@ -777,15 +818,15 @@ private:
     void ShowHelp()
     {
         print("Available commands:");
-        print("  run, r          - Resume execution");
-        print("  bp 0xaddr       - Set breakpoint at address");
-        print("  bc 0xaddr       - Clear breakpoint at address");
-        print("  sto             - Step over (instruction)");
-        print("  sti             - Step into (instruction)");
-        print("  regs            - Show registers");
+        print("  run, r           - Resume execution");
+        print("  bp 0xaddr        - Set breakpoint at address");
+        print("  bc 0xaddr        - Clear breakpoint at address");
+        print("  sto              - Step over (instruction)");
+        print("  sti              - Step into (instruction)");
+        print("  regs             - Show registers");
         print("  read 0xaddr size - Read memory at address");
-        print("  help, h         - Show this help");
-        print("  quit, q         - Exit debugger");
+        print("  help, h          - Show this help");
+        print("  quit, q          - Exit debugger");
     }
 
     void Cleanup()
@@ -883,6 +924,9 @@ int main(int argc, char** argv)
         print("Example: {} build\\testapp.exe", argv[0]);
         return EXIT_FAILURE;
     }
+
+    // Load dbgeng.dll
+    LoadLibraryA("dbgeng.dll");
 
     SimpleDebugger debugger;
 
