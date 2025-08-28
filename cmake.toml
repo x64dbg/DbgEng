@@ -10,6 +10,16 @@ compile-features = ["cxx_std_20"]
 link-libraries = ["DbgEng", "Delayimp"]
 msvc.link-options = ["/DELAYLOAD:dbgeng.dll"]
 
+[target.TitanEngine]
+type = "shared"
+sources = [
+	"src/TitanEngine/TitanEngine.cpp",
+]
+headers = [
+	"src/TitanEngine/TitanEngine.h",
+	"src/TitanEngine/FileMap.h",
+]
+
 [target.testlib]
 type = "shared"
 msvc-runtime = "dynamic"

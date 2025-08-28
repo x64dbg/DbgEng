@@ -64,6 +64,19 @@ if(NOT CMKR_VS_STARTUP_PROJECT)
 	set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT playground)
 endif()
 
+# Target: TitanEngine
+set(TitanEngine_SOURCES
+	cmake.toml
+	"src/TitanEngine/FileMap.h"
+	"src/TitanEngine/TitanEngine.cpp"
+	"src/TitanEngine/TitanEngine.h"
+)
+
+add_library(TitanEngine SHARED)
+
+target_sources(TitanEngine PRIVATE ${TitanEngine_SOURCES})
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${TitanEngine_SOURCES})
+
 # Target: testlib
 set(testlib_SOURCES
 	cmake.toml
