@@ -36,6 +36,12 @@ void logDebug(const std::format_string<Args...> fmt, Args&&... args)
 }
 
 template<class... Args>
+void logError(const std::format_string<Args...> fmt, Args&&... args)
+{
+    printf("[error] %s\n", std::format(fmt, std::forward<Args>(args)...).c_str());
+}
+
+template<class... Args>
 void print(const std::format_string<Args...> fmt, Args&&... args)
 {
     puts(std::format(fmt, std::forward<Args>(args)...).c_str());
@@ -394,7 +400,7 @@ public:
         HRESULT hr = DebugCreate(__uuidof(IDebugClient9), reinterpret_cast<void**>(&m_debugClient));
         if (FAILED(hr))
         {
-            print("Failed to create IDebugClient9: {:#x}", (uint32_t)hr);
+            logError("Failed to create IDebugClient9: {:#x}", (uint32_t)hr);
             return false;
         }
 
@@ -402,35 +408,35 @@ public:
         hr = m_debugClient->QueryInterface(__uuidof(IDebugControl), reinterpret_cast<void**>(&m_debugControl));
         if (FAILED(hr))
         {
-            print("Failed to get IDebugControl: {:#x}", (uint32_t)hr);
+            logError("Failed to get IDebugControl: {:#x}", (uint32_t)hr);
             return false;
         }
 
         hr = m_debugClient->QueryInterface(__uuidof(IDebugDataSpaces), reinterpret_cast<void**>(&m_debugDataSpaces));
         if (FAILED(hr))
         {
-            print("Failed to get IDebugDataSpaces: {:#x}", (uint32_t)hr);
+            logError("Failed to get IDebugDataSpaces: {:#x}", (uint32_t)hr);
             return false;
         }
 
         hr = m_debugClient->QueryInterface(__uuidof(IDebugRegisters), reinterpret_cast<void**>(&m_debugRegisters));
         if (FAILED(hr))
         {
-            print("Failed to get IDebugRegisters: {:#x}", (uint32_t)hr);
+            logError("Failed to get IDebugRegisters: {:#x}", (uint32_t)hr);
             return false;
         }
 
         hr = m_debugClient->QueryInterface(__uuidof(IDebugSymbols), reinterpret_cast<void**>(&m_debugSymbols));
         if (FAILED(hr))
         {
-            print("Failed to get IDebugSymbols: {:#x}", (uint32_t)hr);
+            logError("Failed to get IDebugSymbols: {:#x}", (uint32_t)hr);
             return false;
         }
 
         hr = m_debugClient->QueryInterface(__uuidof(IDebugSystemObjects), reinterpret_cast<void**>(&m_debugSystemObjects));
         if (FAILED(hr))
         {
-            print("Failed to get IDebugSystemObjects: {:#x}", (uint32_t)hr);
+            logError("Failed to get IDebugSystemObjects: {:#x}", (uint32_t)hr);
             return false;
         }
 
@@ -439,7 +445,7 @@ public:
         hr = m_debugClient->SetEventCallbacksWide(m_eventCallbacks);
         if (FAILED(hr))
         {
-            print("Failed to set event callbacks: {:#x}", (uint32_t)hr);
+            logError("Failed to set event callbacks: {:#x}", (uint32_t)hr);
             return false;
         }
 
@@ -447,7 +453,7 @@ public:
         hr = m_debugControl->SetEngineOptions(DEBUG_ENGOPT_INITIAL_BREAK | DEBUG_ENGOPT_DISABLE_MODULE_SYMBOL_LOAD);
         if (FAILED(hr))
         {
-            print("Failed to set engine options: {:#x}", (uint32_t)hr);
+            logError("Failed to set engine options: {:#x}", (uint32_t)hr);
             return false;
         }
 
@@ -459,14 +465,14 @@ public:
     {
         if (!m_debugActive)
         {
-            print("Debugger not initialized");
+            logError("Debugger not initialized");
             return false;
         }
 
         HRESULT hr = m_debugClient->CreateProcess(0, const_cast<char*>(executablePath), DEBUG_ONLY_THIS_PROCESS);
         if (FAILED(hr))
         {
-            print("Failed to create process: {:#x}", (uint32_t)hr);
+            logError("Failed to create process: {:#x}", (uint32_t)hr);
             return false;
         }
 
@@ -474,7 +480,7 @@ public:
         hr = m_debugControl->WaitForEvent(DEBUG_WAIT_DEFAULT, INFINITE);
         if (FAILED(hr))
         {
-            print("Failed to wait for initial event: {:#x}", (uint32_t)hr);
+            logError("Failed to wait for initial event: {:#x}", (uint32_t)hr);
             return false;
         }
 
@@ -537,7 +543,7 @@ public:
         }
         else
         {
-            print("Unknown command: {} (type 'help' for available commands)", cmd);
+            logError("Unknown command: {} (type 'help' for available commands)", cmd);
             return true;
         }
     }
@@ -547,14 +553,14 @@ private:
     {
         if (!m_processRunning)
         {
-            print("No process running");
+            logError("No process running");
             return true;
         }
 
         HRESULT hr = m_debugControl->SetExecutionStatus(DEBUG_STATUS_GO);
         if (FAILED(hr))
         {
-            print("Failed to resume execution: {:#x}", (uint32_t)hr);
+            logError("Failed to resume execution: {:#x}", (uint32_t)hr);
             return true;
         }
 
@@ -564,7 +570,7 @@ private:
         hr = m_debugControl->WaitForEvent(DEBUG_WAIT_DEFAULT, INFINITE);
         if (FAILED(hr))
         {
-            print("WaitForEvent failed: {:#x}", (uint32_t)hr);
+            logError("WaitForEvent failed: {:#x}", (uint32_t)hr);
             return true;
         }
 
@@ -583,14 +589,14 @@ private:
     {
         if (!m_processRunning)
         {
-            print("No process running");
+            logError("No process running");
             return true;
         }
 
         ULONG64 address = ParseAddress(addrStr);
         if (address == 0)
         {
-            print("Invalid address: {}", addrStr);
+            logError("Invalid address: {}", addrStr);
             return true;
         }
 
@@ -598,14 +604,14 @@ private:
         HRESULT hr = m_debugControl->AddBreakpoint(DEBUG_BREAKPOINT_CODE, DEBUG_ANY_ID, &bp);
         if (FAILED(hr))
         {
-            print("Failed to add breakpoint: {:#x}", (uint32_t)hr);
+            logError("Failed to add breakpoint: {:#x}", (uint32_t)hr);
             return true;
         }
 
         hr = bp->SetOffset(address);
         if (FAILED(hr))
         {
-            print("Failed to set breakpoint offset: {:#x}", (uint32_t)hr);
+            logError("Failed to set breakpoint offset: {:#x}", (uint32_t)hr);
             bp->Release();
             return true;
         }
@@ -613,7 +619,7 @@ private:
         hr = bp->SetFlags(DEBUG_BREAKPOINT_ENABLED);
         if (FAILED(hr))
         {
-            print("Failed to enable breakpoint: {:#x}", (uint32_t)hr);
+            logError("Failed to enable breakpoint: {:#x}", (uint32_t)hr);
             bp->Release();
             return true;
         }
@@ -628,7 +634,7 @@ private:
         ULONG64 address = ParseAddress(addrStr);
         if (address == 0)
         {
-            print("Invalid address: {}", addrStr);
+            logError("Invalid address: {}", addrStr);
             return true;
         }
 
@@ -644,7 +650,7 @@ private:
                 }
                 else
                 {
-                    print("Failed to remove breakpoint: {:#x}", (uint32_t)hr);
+                    logError("Failed to remove breakpoint: {:#x}", (uint32_t)hr);
                 }
                 (*it)->Release();
                 m_breakpoints.erase(it);
@@ -660,14 +666,14 @@ private:
     {
         if (!m_processRunning)
         {
-            print("No process running");
+            logError("No process running");
             return true;
         }
 
         HRESULT hr = m_debugControl->SetExecutionStatus(DEBUG_STATUS_STEP_OVER);
         if (FAILED(hr))
         {
-            print("Failed to step over: {:#x}", (uint32_t)hr);
+            logError("Failed to step over: {:#x}", (uint32_t)hr);
             return true;
         }
 
@@ -675,7 +681,7 @@ private:
         hr = m_debugControl->WaitForEvent(DEBUG_WAIT_DEFAULT, INFINITE);
         if (FAILED(hr))
         {
-            print("WaitForEvent failed: {:#x}", (uint32_t)hr);
+            logError("WaitForEvent failed: {:#x}", (uint32_t)hr);
         }
 
         return true;
@@ -685,14 +691,14 @@ private:
     {
         if (!m_processRunning)
         {
-            print("No process running");
+            logError("No process running");
             return true;
         }
 
         HRESULT hr = m_debugControl->SetExecutionStatus(DEBUG_STATUS_STEP_INTO);
         if (FAILED(hr))
         {
-            print("Failed to step into: {:#x}", (uint32_t)hr);
+            logError("Failed to step into: {:#x}", (uint32_t)hr);
             return true;
         }
 
@@ -700,7 +706,7 @@ private:
         hr = m_debugControl->WaitForEvent(DEBUG_WAIT_DEFAULT, INFINITE);
         if (FAILED(hr))
         {
-            print("WaitForEvent failed: {:#x}", (uint32_t)hr);
+            logError("WaitForEvent failed: {:#x}", (uint32_t)hr);
         }
 
         return true;
@@ -710,7 +716,7 @@ private:
     {
         if (!m_processRunning)
         {
-            print("No process running");
+            logError("No process running");
             return true;
         }
 
@@ -718,7 +724,7 @@ private:
         HRESULT hr = m_debugRegisters->GetNumberRegisters(&numRegs);
         if (FAILED(hr))
         {
-            print("Failed to get register count: {:#x}", (uint32_t)hr);
+            logError("Failed to get register count: {:#x}", (uint32_t)hr);
             return true;
         }
 
@@ -751,21 +757,21 @@ private:
     {
         if (!m_processRunning)
         {
-            print("No process running");
+            logError("No process running");
             return true;
         }
 
         ULONG64 address = ParseAddress(addrStr);
         if (address == 0)
         {
-            print("Invalid address: {}", addrStr);
+            logError("Invalid address: {}", addrStr);
             return true;
         }
 
         ULONG size = static_cast<ULONG>(std::stoul(sizeStr, nullptr, 0));
         if (size == 0 || size > 1024)
         {
-            print("Invalid size: {} (must be 1-1024)", sizeStr);
+            logError("Invalid size: {} (must be 1-1024)", sizeStr);
             return true;
         }
 
@@ -775,7 +781,7 @@ private:
         HRESULT hr = m_debugDataSpaces->ReadVirtual(address, buffer.data(), size, &bytesRead);
         if (FAILED(hr))
         {
-            print("Failed to read memory: {:#x}", (uint32_t)hr);
+            logError("Failed to read memory: {:#x}", (uint32_t)hr);
             return true;
         }
 
@@ -932,13 +938,13 @@ int main(int argc, char** argv)
 
     if (!debugger.Initialize())
     {
-        print("Failed to initialize debugger");
+        logError("Failed to initialize debugger");
         return EXIT_FAILURE;
     }
 
     if (!debugger.LaunchProcess(argv[1]))
     {
-        print("Failed to launch process: {}", argv[1]);
+        logError("Failed to launch process: {}", argv[1]);
         return EXIT_FAILURE;
     }
 
