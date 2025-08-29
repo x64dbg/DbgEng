@@ -77,6 +77,21 @@ add_library(TitanEngine SHARED)
 target_sources(TitanEngine PRIVATE ${TitanEngine_SOURCES})
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${TitanEngine_SOURCES})
 
+target_compile_features(TitanEngine PUBLIC
+	cxx_std_20
+)
+
+target_link_libraries(TitanEngine PUBLIC
+	DbgEng
+	Delayimp
+)
+
+if(MSVC) # msvc
+	target_link_options(TitanEngine PUBLIC
+		"/DELAYLOAD:dbgeng.dll"
+	)
+endif()
+
 # Target: testlib
 set(testlib_SOURCES
 	cmake.toml

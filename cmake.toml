@@ -19,6 +19,9 @@ headers = [
 	"src/TitanEngine/TitanEngine.h",
 	"src/TitanEngine/FileMap.h",
 ]
+compile-features = ["cxx_std_20"]
+link-libraries = ["DbgEng", "Delayimp"]
+msvc.link-options = ["/DELAYLOAD:dbgeng.dll"]
 
 [target.testlib]
 type = "shared"

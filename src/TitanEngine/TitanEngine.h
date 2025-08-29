@@ -320,7 +320,7 @@ __declspec(dllexport) void* GetPEBLocation(HANDLE hProcess);
 __declspec(dllexport) void* GetTEBLocation(HANDLE hThread);
 __declspec(dllexport) bool HideDebugger(HANDLE hProcess, TitanHideLevel HideLevel); // TODO: remove
 // TitanEngine.Debugger.functions:
-__declspec(dllexport) void* InitDebugW(const wchar_t* szFileName, const wchar_t* szCommandLine, const wchar_t* szCurrentFolder);
+__declspec(dllexport) PROCESS_INFORMATION* InitDebugW(const wchar_t* szFileName, const wchar_t* szCommandLine, const wchar_t* szCurrentFolder);
 __declspec(dllexport) bool StopDebug();
 __declspec(dllexport) void SetBPXOptions(TitanBreakpointType DefaultBreakPointType);
 __declspec(dllexport) bool IsBPXEnabled(ULONG_PTR bpxAddress);
