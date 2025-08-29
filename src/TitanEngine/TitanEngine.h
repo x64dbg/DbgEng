@@ -316,8 +316,8 @@ __declspec(dllexport) ULONG_PTR ConvertFileOffsetToVA(ULONG_PTR FileMapVA, ULONG
 __declspec(dllexport) bool MemoryReadSafe(HANDLE hProcess, LPVOID lpBaseAddress, LPVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesRead);
 __declspec(dllexport) bool MemoryWriteSafe(HANDLE hProcess, LPVOID lpBaseAddress, LPCVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesWritten);
 // TitanEngine.Hider.functions:
-__declspec(dllexport) void* GetPEBLocation(HANDLE hProcess);
-__declspec(dllexport) void* GetTEBLocation(HANDLE hThread);
+__declspec(dllexport) ULONG_PTR GetPEBLocation(HANDLE hProcess);
+__declspec(dllexport) ULONG_PTR GetTEBLocation(HANDLE hThread);
 __declspec(dllexport) bool HideDebugger(HANDLE hProcess, TitanHideLevel HideLevel); // TODO: remove
 // TitanEngine.Debugger.functions:
 __declspec(dllexport) PROCESS_INFORMATION* InitDebugW(const wchar_t* szFileName, const wchar_t* szCommandLine, const wchar_t* szCurrentFolder);
@@ -338,7 +338,7 @@ __declspec(dllexport) bool GetAVX512Context(HANDLE hActiveThread, TITAN_ENGINE_C
 __declspec(dllexport) bool SetAVX512Context(HANDLE hActiveThread, TITAN_ENGINE_CONTEXT_AVX512_t* titcontext);
 __declspec(dllexport) bool Fill(LPVOID MemoryStart, DWORD MemorySize, PBYTE FillByte); // TODO: remove
 __declspec(dllexport) const DEBUG_EVENT* GetDebugData(); // TODO: remove?
-__declspec(dllexport) void SetCustomHandler(TitanCustomHandler ExceptionId, TITANCBCH CallBack);
+__declspec(dllexport) void SetCustomHandler(TitanCustomHandler ExceptionId, TITANCALLBACKARG CallBack);
 __declspec(dllexport) void StepInto(TITANCBSTEP traceCallBack);
 __declspec(dllexport) void StepOver(TITANCBSTEP traceCallBack);
 __declspec(dllexport) bool GetUnusedHardwareBreakPointRegister(LPDWORD RegisterIndex);
