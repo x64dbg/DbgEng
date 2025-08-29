@@ -4,6 +4,7 @@
 #include <mutex>
 #include <queue>
 #include <functional>
+#include <atomic>
 
 #include "TitanEngine.h"
 #include "FileMap.h"
@@ -181,6 +182,7 @@ struct BreakpointInfo
     TITANCBSOFTBP callback = nullptr;
 };
 
+static PROCESS_INFORMATION gProcessInfo;
 static std::map<TitanEngineVariable, bool> gEngineVariables;
 static TitanBreakpointType gDefaultBreakpointType = UE_BREAKPOINT_INT3;
 static std::map<TitanCustomHandler, TITANCALLBACKARG> gCustomHandlers;
@@ -191,6 +193,9 @@ static std::map<HANDLE, uint64_t> gProcessPebCache;
 static std::map<HANDLE, uint64_t> gProcessTebCache;
 static DebugIdMap gDebugIdMap;
 static std::map<ULONG, BreakpointInfo> gBreakpoints;
+static std::recursive_mutex gMutexPaused;
+static std::atomic_bool gPaused;
+static std::atomic_bool gIsDebugging;
 
 /* DbgEng interfaces:
 #define INTERFACE IDebugAdvanced4
@@ -232,6 +237,43 @@ static bool IsDebugThread()
 {
     return gDebugThread == GetCurrentThreadId();
 }
+
+struct PauseLock
+{
+    PauseLock()
+    {
+        if (!(gPaused && gIsDebugging))
+        {
+            mLocked = false;
+        }
+        else
+        {
+            gMutexPaused.lock();
+            mLocked = true;
+        }
+    }
+
+    ~PauseLock()
+    {
+        if (mLocked)
+        {
+            gMutexPaused.unlock();
+        }
+    }
+
+    PauseLock(const PauseLock&) = delete;
+    PauseLock& operator=(const PauseLock&) = delete;
+    PauseLock(PauseLock&&) = delete;
+    PauseLock& operator=(PauseLock&&) = delete;
+
+    operator bool() const
+    {
+        return mLocked;
+    }
+
+private:
+    bool mLocked = false;
+};
 
 static void queueCallback(std::function<bool()> work)
 {
@@ -444,6 +486,25 @@ public:
             logDebug("    ExceptionInformation[{}]: {:#x}", i, Exception->ExceptionInformation[i]);
         }
 
+        EXCEPTION_DEBUG_INFO info = {};
+        info.dwFirstChance = FirstChance;
+        info.ExceptionRecord.ExceptionAddress = (PVOID)Exception->ExceptionAddress;
+        info.ExceptionRecord.ExceptionCode = Exception->ExceptionCode;
+        info.ExceptionRecord.ExceptionFlags = Exception->ExceptionFlags;
+        info.ExceptionRecord.NumberParameters = Exception->NumberParameters;
+        for (int i = 0; i < Exception->NumberParameters && i < EXCEPTION_MAXIMUM_PARAMETERS; i++)
+        {
+            info.ExceptionRecord.ExceptionInformation[i] = (ULONG_PTR)Exception->ExceptionInformation[i];
+        }
+
+        auto work = [=]
+        {
+            setFakeDebugEvent(info);
+            gCustomHandlers.at(UE_CH_UNHANDLEDEXCEPTION)(&info);
+            return true;
+        };
+        queueCallback(std::move(work));
+
         return DEBUG_STATUS_BREAK;
     }
 
@@ -549,6 +610,14 @@ public:
             // NOTE: unused by x64dbg (since winapi doesn't set it reliably)
             info.lpImageName = nullptr;
             info.fUnicode = 0;
+
+            if (gProcessInfo.dwProcessId == 0)
+            {
+                gProcessInfo.hProcess = info.hProcess;
+                gProcessInfo.hThread = info.hThread;
+                gProcessInfo.dwProcessId = debugProcessId();
+                gProcessInfo.dwThreadId = debugThreadId();
+            }
 
             // NOTE: Used by GetTEBLocation
             gProcessTebCache[info.hThread] = ThreadDataOffset;
@@ -912,11 +981,20 @@ struct RegisterCache
         }
 
         // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/dbgeng/nf-dbgeng-idebugregisters2-getvalues2#remarks
+        //
         auto hr = gDebugRegisters->GetValues(Count, Indices.data(), 0, Values.data());
         if (hr == E_UNEXPECTED)
         {
             logError("Failed to get register values");
             return false;
+        }
+
+        for (ULONG i = 0; i < Count; i++)
+        {
+            if (Values[i].Type == DEBUG_VALUE_INVALID)
+            {
+                logError("register[{}]: {} has DEBUG_VALUE_INVALID", i, Names[i]);
+            }
         }
 
         return true;
@@ -1119,6 +1197,8 @@ static bool InitializeDbgEng()
 // TitanEngine.Dumper.functions:
 __declspec(dllexport) ULONG_PTR ConvertVAtoFileOffsetEx(ULONG_PTR FileMapVA, DWORD FileSize, ULONG_PTR ImageBase, ULONG_PTR AddressToConvert, bool AddressIsRVA, bool ReturnType)
 {
+    // TODO: implement properly
+    return 0;
     __debugbreak();
     return {};
 }
@@ -1131,13 +1211,43 @@ __declspec(dllexport) ULONG_PTR ConvertFileOffsetToVA(ULONG_PTR FileMapVA, ULONG
 
 __declspec(dllexport) bool MemoryReadSafe(HANDLE hProcess, LPVOID lpBaseAddress, LPVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesRead)
 {
-    if (!IsDebugThread())
+    // NOTE: This happens because x64dbg refreshes the memory map before cbCreateProcess in the background
+    if (!hProcess)
+        return false;
+
+    // NOTE: This happens because the GUI reads in the background
+    if ((ULONG_PTR)lpBaseAddress < 0x10000)
+        return false;
+
+    PauseLock pl;
+    if (!pl)
     {
-        logError("MemoryReadSafe called from non-debug thread!");
         return false;
     }
-    // TODO: switch hProcess?
-    auto hr = gDebugDataSpaces->ReadVirtual((ULONG64)(ULONG_PTR)lpBaseAddress, lpBuffer, nSize, (ULONG*)lpNumberOfBytesRead);
+
+    auto itr = gDebugIdMap.processHandleToIndex.find(hProcess);
+    if (itr == gDebugIdMap.processHandleToIndex.end())
+    {
+        logError("Unknown process handle in MemoryReadSafe: {:#x}", (uint64_t)(ULONG_PTR)hProcess);
+        __debugbreak();
+        return 0;
+    }
+
+    auto processIndex = itr->second;
+    ULONG currentIndex = 0;
+    auto hr = gDebugSystemObjects->GetCurrentProcessId(&currentIndex);
+    if (FAILED(hr))
+    {
+        logError("Failed to get current thread index: {:#x}", (uint32_t)hr);
+        return 0;
+    }
+    if (currentIndex != processIndex)
+    {
+        // TODO: switch hProcess?
+        __debugbreak();
+    }
+
+    hr = gDebugDataSpaces->ReadVirtual((ULONG64)(ULONG_PTR)lpBaseAddress, lpBuffer, nSize, (ULONG*)lpNumberOfBytesRead);
     if (FAILED(hr))
     {
         logError("ReadVirtual failed: {:#x}", (uint32_t)hr);
@@ -1155,22 +1265,36 @@ __declspec(dllexport) bool MemoryWriteSafe(HANDLE hProcess, LPVOID lpBaseAddress
 // TitanEngine.Hider.functions:
 __declspec(dllexport) ULONG_PTR GetPEBLocation(HANDLE hProcess)
 {
-    if (!IsDebugThread())
+    PauseLock pl;
+    if (!pl)
     {
-        logError("GetPEBLocation called from non-debug thread!");
         return 0;
     }
-    return gProcessPebCache.at(hProcess);
+    auto itr = gProcessPebCache.find(hProcess);
+    if (itr == gProcessPebCache.end())
+    {
+        logError("Unknown process handle in GetPEBLocation: {:#x}", (uint64_t)(ULONG_PTR)hProcess);
+        __debugbreak();
+        return 0;
+    }
+    return itr->second;
 }
 
 __declspec(dllexport) ULONG_PTR GetTEBLocation(HANDLE hThread)
 {
-    if (!IsDebugThread())
+    PauseLock pl;
+    if (!pl)
     {
-        logError("GetTEBLocation called from non-debug thread!");
         return 0;
     }
-    return gProcessTebCache.at(hThread);
+    auto itr = gProcessTebCache.find(hThread);
+    if (itr == gProcessTebCache.end())
+    {
+        logError("Unknown thread handle in GetTEBLocation: {:#x}", (uint64_t)(ULONG_PTR)hThread);
+        __debugbreak();
+        return 0;
+    }
+    return itr->second;
 }
 
 __declspec(dllexport) bool HideDebugger(HANDLE hProcess, TitanHideLevel HideLevel)
@@ -1182,7 +1306,6 @@ __declspec(dllexport) bool HideDebugger(HANDLE hProcess, TitanHideLevel HideLeve
 // TitanEngine.Debugger.functions:
 __declspec(dllexport) PROCESS_INFORMATION* InitDebugW(const wchar_t* szFileName, const wchar_t* szCommandLine, const wchar_t* szCurrentFolder)
 {
-    static PROCESS_INFORMATION pi = {};
     std::wstring commandLine = szFileName;
     if (szCommandLine)
     {
@@ -1200,17 +1323,13 @@ __declspec(dllexport) PROCESS_INFORMATION* InitDebugW(const wchar_t* szFileName,
 
     gDebugThread = GetCurrentThreadId();
 
-    return &pi;
+    return &gProcessInfo;
 }
 
 __declspec(dllexport) bool StopDebug()
 {
-    gDebugClient->EndSession(DEBUG_END_ACTIVE_TERMINATE);
-    if (!IsDebugThread())
-    {
-        __debugbreak();
-    }
-    return {};
+    auto hr = gDebugClient->EndSession(DEBUG_END_ACTIVE_TERMINATE);
+    return SUCCEEDED(hr);
 }
 
 __declspec(dllexport) void SetBPXOptions(TitanBreakpointType DefaultBreakPointType)
@@ -1258,7 +1377,10 @@ __declspec(dllexport) bool SetBPX(ULONG_PTR bpxAddress, DWORD bpxType /* TitanSo
         return false;
     }
 
-    hr = info.bp->SetFlags(DEBUG_BREAKPOINT_ENABLED);
+    auto flags = DEBUG_BREAKPOINT_ENABLED;
+    if (bpxType & UE_SINGLESHOOT)
+        flags |= DEBUG_BREAKPOINT_ONE_SHOT;
+    hr = info.bp->SetFlags(flags);
     if (FAILED(hr))
     {
         logError("Failed to enable breakpoint: {:#x}", (uint32_t)hr);
@@ -1297,13 +1419,68 @@ __declspec(dllexport) bool RemoveMemoryBPX(ULONG_PTR MemoryStart, SIZE_T SizeOfM
 
 __declspec(dllexport) bool GetFullContextDataEx(HANDLE hActiveThread, TITAN_ENGINE_CONTEXT_t* titcontext)
 {
-    if (!IsDebugThread())
+    // Zero out the context structure to avoid uninitialized data
+    *titcontext = {};
+
+    PauseLock pl;
+    if (!pl)
     {
-        logError("GetFullContextDataEx called from non-debug thread!");
         return false;
     }
-    __debugbreak();
-    return {};
+
+    auto itr = gDebugIdMap.threadHandleToIndex.find(hActiveThread);
+    if (itr == gDebugIdMap.threadHandleToIndex.end())
+    {
+        logError("Unknown thread handle in GetFullContextDataEx: {:#x}", (uint64_t)(ULONG_PTR)hActiveThread);
+        __debugbreak();
+        return false;
+    }
+    auto threadIndex = itr->second;
+    ULONG currentIndex = 0;
+    auto hr = gDebugSystemObjects->GetCurrentThreadId(&currentIndex);
+    if (FAILED(hr))
+    {
+        logError("Failed to get current thread index: {:#x}", (uint32_t)hr);
+        return false;
+    }
+    if (threadIndex != currentIndex)
+        __debugbreak();
+
+    titcontext->cax = gRegisterCache.GetValue(UE_RAX);
+    titcontext->cbx = gRegisterCache.GetValue(UE_RBX);
+    titcontext->ccx = gRegisterCache.GetValue(UE_RCX);
+    titcontext->cdx = gRegisterCache.GetValue(UE_RDX);
+    titcontext->csi = gRegisterCache.GetValue(UE_RSI);
+    titcontext->cdi = gRegisterCache.GetValue(UE_RDI);
+    titcontext->cbp = gRegisterCache.GetValue(UE_RBP);
+    titcontext->csp = gRegisterCache.GetValue(UE_RSP);
+    titcontext->cip = gRegisterCache.GetValue(UE_RIP);
+    titcontext->eflags = gRegisterCache.GetValue(UE_RFLAGS);
+    titcontext->r8 = gRegisterCache.GetValue(UE_R8);
+    titcontext->r9 = gRegisterCache.GetValue(UE_R9);
+    titcontext->r10 = gRegisterCache.GetValue(UE_R10);
+    titcontext->r11 = gRegisterCache.GetValue(UE_R11);
+    titcontext->r12 = gRegisterCache.GetValue(UE_R12);
+    titcontext->r13 = gRegisterCache.GetValue(UE_R13);
+    titcontext->r14 = gRegisterCache.GetValue(UE_R14);
+    titcontext->r15 = gRegisterCache.GetValue(UE_R15);
+    titcontext->cs = (WORD)gRegisterCache.GetValue(UE_SEG_CS);
+    titcontext->ss = (WORD)gRegisterCache.GetValue(UE_SEG_SS);
+    titcontext->ds = (WORD)gRegisterCache.GetValue(UE_SEG_DS);
+    titcontext->es = (WORD)gRegisterCache.GetValue(UE_SEG_ES);
+    titcontext->fs = (WORD)gRegisterCache.GetValue(UE_SEG_FS);
+    titcontext->gs = (WORD)gRegisterCache.GetValue(UE_SEG_GS);
+    titcontext->dr0 = gRegisterCache.GetValue(UE_DR0);
+    titcontext->dr1 = gRegisterCache.GetValue(UE_DR1);
+    titcontext->dr2 = gRegisterCache.GetValue(UE_DR2);
+    titcontext->dr3 = gRegisterCache.GetValue(UE_DR3);
+    titcontext->dr6 = gRegisterCache.GetValue(UE_DR6);
+    titcontext->dr7 = gRegisterCache.GetValue(UE_DR7);
+    titcontext->MxCsr = (DWORD)gRegisterCache.GetValue(UE_MXCSR);
+
+    // TODO: support xmm/ymm registers
+
+    return true;
 }
 
 __declspec(dllexport) bool SetFullContextDataEx(HANDLE hActiveThread, TITAN_ENGINE_CONTEXT_t* titcontext)
@@ -1314,12 +1491,20 @@ __declspec(dllexport) bool SetFullContextDataEx(HANDLE hActiveThread, TITAN_ENGI
 
 __declspec(dllexport) ULONG_PTR GetContextDataEx(HANDLE hActiveThread, TitanRegister IndexOfRegister)
 {
-    if (!IsDebugThread())
+    PauseLock pl;
+    if (!pl)
     {
-        logError("GetContextDataEx called from non-debug thread!");
         return 0;
     }
-    auto threadIndex = gDebugIdMap.threadHandleToIndex.at(hActiveThread);
+
+    auto itr = gDebugIdMap.threadHandleToIndex.find(hActiveThread);
+    if (itr == gDebugIdMap.threadHandleToIndex.end())
+    {
+        logError("Unknown thread handle in GetContextDataEx: {:#x}", (uint64_t)(ULONG_PTR)hActiveThread);
+        __debugbreak();
+        return 0;
+    }
+    auto threadIndex = itr->second;
     ULONG currentIndex = 0;
     auto hr = gDebugSystemObjects->GetCurrentThreadId(&currentIndex);
     if (FAILED(hr))
@@ -1340,13 +1525,33 @@ __declspec(dllexport) bool SetContextDataEx(HANDLE hActiveThread, TitanRegister 
 
 __declspec(dllexport) bool GetAVXContext(HANDLE hActiveThread, TITAN_ENGINE_CONTEXT_t* titcontext)
 {
-    if (!IsDebugThread())
+    PauseLock pl;
+    if (!pl)
     {
-        logError("GetAVXContext called from non-debug thread!");
         return false;
     }
-    __debugbreak();
-    return {};
+
+    auto itr = gDebugIdMap.threadHandleToIndex.find(hActiveThread);
+    if (itr == gDebugIdMap.threadHandleToIndex.end())
+    {
+        logError("Unknown thread handle in GetAVXContext: {:#x}", (uint64_t)(ULONG_PTR)hActiveThread);
+        __debugbreak();
+        return false;
+    }
+    auto threadIndex = itr->second;
+    ULONG currentIndex = 0;
+    auto hr = gDebugSystemObjects->GetCurrentThreadId(&currentIndex);
+    if (FAILED(hr))
+    {
+        logError("Failed to get current thread index: {:#x}", (uint32_t)hr);
+        return false;
+    }
+    if (threadIndex != currentIndex)
+        __debugbreak();
+    
+    // TODO: implement xmm/ymm registers
+
+    return true;
 }
 
 __declspec(dllexport) bool SetAVXContext(HANDLE hActiveThread, TITAN_ENGINE_CONTEXT_t* titcontext)
@@ -1357,13 +1562,19 @@ __declspec(dllexport) bool SetAVXContext(HANDLE hActiveThread, TITAN_ENGINE_CONT
 
 __declspec(dllexport) bool GetAVX512Context(HANDLE hActiveThread, TITAN_ENGINE_CONTEXT_AVX512_t* titcontext)
 {
-    if (!IsDebugThread())
+    // TODO: implement AVX-512 support
+    // Fall back to using AVX and fill the rest with 0
+    TITAN_ENGINE_CONTEXT_t Avx = {};
+    if (GetAVXContext(hActiveThread, &Avx))
     {
-        logError("GetAVX512Context called from non-debug thread!");
+        for (int i = 0; i < _countof(Avx.YmmRegisters); i++)
+            titcontext->ZmmRegisters[i].Low = Avx.YmmRegisters[i];
+        return true;
+    }
+    else
+    {
         return false;
     }
-    __debugbreak();
-    return {};
 }
 
 __declspec(dllexport) bool SetAVX512Context(HANDLE hActiveThread, TITAN_ENGINE_CONTEXT_AVX512_t* titcontext)
@@ -1435,8 +1646,12 @@ __declspec(dllexport) void DebugLoop()
         __debugbreak();
     logDebug("[{}] dwThreadId: {:#x}", __func__, GetCurrentThreadId());
 
+    gIsDebugging.store(true);
     while (true)
     {
+        // NOTE: The idea with gPaused and gMutexPaused is to allow other threads to read registers while we're paused
+        // but while waiting for an event all those functions will fail instead.
+        gPaused.store(false);
         auto hr = gDebugControl->WaitForEvent(DEBUG_WAIT_DEFAULT, INFINITE);
         if (FAILED(hr))
         {
@@ -1444,12 +1659,23 @@ __declspec(dllexport) void DebugLoop()
             break;
         }
 
-        if (!gRegisterCache.Read())
+        // We acquire the mutex here to ensure no other threads are using the cache
         {
-            break;
+            std::lock_guard lgPaused(gMutexPaused);
+            if (!gRegisterCache.Read())
+            {
+                break;
+            }
         }
 
-        std::lock_guard lg(gMutexCallbackQueue);
+        // After this point other threads will fail before trying to even acquire the lock
+        gPaused.store(true);
+
+        std::lock_guard lgQueue(gMutexCallbackQueue);
+        if (gCallbackQueue.empty())
+        {
+            __debugbreak();
+        }
         // TODO: this should never be more than 1?
         logDebug("Processing {} queued callbacks", gCallbackQueue.size());
         while (!gCallbackQueue.empty())
@@ -1464,13 +1690,18 @@ __declspec(dllexport) void DebugLoop()
             }
         }
 
-        if (!gRegisterCache.Flush())
         {
-            break;
+            std::lock_guard lgPaused(gMutexPaused);
+            if (!gRegisterCache.Flush())
+            {
+                break;
+            }
         }
     }
+    gIsDebugging.store(false);
 
     // Reset caches
+    gProcessInfo = {};
     gCustomHandlers = {};
     gFakeDebugEvent = {};
     {
@@ -1485,7 +1716,18 @@ __declspec(dllexport) void DebugLoop()
 
 __declspec(dllexport) void SetNextDbgContinueStatus(DWORD SetDbgCode)
 {
-    __debugbreak();
+    switch (SetDbgCode)
+    {
+    case DBG_EXCEPTION_NOT_HANDLED:
+        logDebug("Next continue status: DBG_EXCEPTION_NOT_HANDLED");
+        break;
+    case DBG_CONTINUE:
+        logDebug("Next continue status: DBG_CONTINUE");
+        // TODO: how to continue?
+        break;
+    default:
+        __debugbreak();
+    }
 }
 
 __declspec(dllexport) bool AttachDebugger(DWORD ProcessId, bool KillOnExit, LPVOID DebugInfo, TITANCALLBACK CallBack)
