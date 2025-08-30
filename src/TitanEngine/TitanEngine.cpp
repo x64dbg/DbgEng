@@ -127,6 +127,20 @@ static FlagInfo statusFlags[] = {
 };
 
 template<size_t N>
+static std::string formatSingleFlag(FlagInfo const (&flags)[N], uint32_t value)
+{
+    auto info = std::find(std::begin(flags), std::end(flags), value);
+    if (info == std::end(flags))
+    {
+        return std::format("{:#x} <unknown>", value);
+    }
+    else
+    {
+        return std::format("{} ({})", info->name, info->description);
+    }
+}
+
+template<size_t N>
 static void logSingleFlag(const char* name, FlagInfo const (&flags)[N], uint32_t value)
 {
     auto info = std::find(std::begin(flags), std::end(flags), value);
@@ -194,8 +208,9 @@ static std::map<HANDLE, uint64_t> gProcessTebCache;
 static DebugIdMap gDebugIdMap;
 static std::map<ULONG, BreakpointInfo> gBreakpoints;
 static std::recursive_mutex gMutexPaused;
-static std::atomic_bool gPaused;
+static std::atomic_bool gPaused; // this is set to true when we are not inside WaitForEvent (perhaps it should be renamed?)
 static std::atomic_bool gIsDebugging;
+static bool gDbgEngInitialized = false;
 
 /* DbgEng interfaces:
 #define INTERFACE IDebugAdvanced4
@@ -231,11 +246,13 @@ static IDebugDataSpaces4* gDebugDataSpaces = nullptr;
 static IDebugRegisters2* gDebugRegisters = nullptr;
 static IDebugSymbols5* gDebugSymbols = nullptr;
 static IDebugSystemObjects4* gDebugSystemObjects = nullptr;
-static DWORD gDebugThread = 0;
+static DWORD gDebugThreadId = 0;
+static std::map<ULONG, TITANCBSTEP> gStepCallbacks;
+static ULONG gNextExecutionStatus = DEBUG_STATUS_NO_CHANGE;
 
 static bool IsDebugThread()
 {
-    return gDebugThread == GetCurrentThreadId();
+    return gDebugThreadId == GetCurrentThreadId();
 }
 
 struct PauseLock
@@ -373,11 +390,25 @@ static void setFakeDebugEvent(const OUTPUT_DEBUG_STRING_INFO& info)
     gFakeDebugEvent.u.DebugString = info;
 }
 
-// Event callback class
+/* Event callback class. Some notes about how events are delivered:
+ChangeEngineState:
+- Called during initialization (DEBUG_CES_EVENT_FILTERS, DEBUG_CES_ENGINE_OPTIONS)
+- Called from inside APIs (gDebugClient->CreateProcessWide, gDebugControl->SetExecutionStatus, gDebugControl->AddBreakpoint2)
+- Also delivered from DebugLoop (WaitForEvent)
+SessionStatus: delivered with APC
+ChangeDebuggeeState: delivered in DebugLoop, AddBreakpoint2
+DEBUG_CDS_REFRESH after setting breakpoint
+CreateProcess: delivered with APC
+ChangeEngineState: delivered in DebugLoop
+LoadModule: delivered with APC
+Breakpoint: delivered with APC
+ChangeSymbolState: DebugLoop (WaitForEvent)
+*/
 class DebugEventCallbacks : public IDebugEventCallbacksWide
 {
 private:
     ULONG mRefCount = 1;
+    DWORD mEventThreadId = GetCurrentThreadId();
 
 public:
     // IUnknown methods
@@ -415,6 +446,9 @@ public:
 
     STDMETHOD(Breakpoint)(PDEBUG_BREAKPOINT2 Bp) override
     {
+        if (GetCurrentThreadId() != mEventThreadId)
+            __debugbreak();
+
         logDebug("[{}] Breakpoint hit", __func__);
         ULONG64 offset = 0;
         auto hr = Bp->GetOffset(&offset);
@@ -474,6 +508,9 @@ public:
 
     STDMETHOD(Exception)(PEXCEPTION_RECORD64 Exception, ULONG FirstChance) override
     {
+        if (GetCurrentThreadId() != mEventThreadId)
+            __debugbreak();
+
         logDebug("[{}] Exception thrown", __func__);
         logDebug("  FirstChance: {}", FirstChance);
         logDebug("  ExceptionCode: {:#x}", Exception->ExceptionCode);
@@ -510,6 +547,9 @@ public:
 
     STDMETHOD(CreateThread)(ULONG64 Handle, ULONG64 DataOffset, ULONG64 StartOffset) override
     {
+        if (GetCurrentThreadId() != mEventThreadId)
+            __debugbreak();
+
         logDebug("[{}] Thread created", __func__);
         logDebug("  Handle: {:#x}", Handle);
         logDebug("  DataOffset: {:#x}", DataOffset);
@@ -557,6 +597,9 @@ public:
 
     STDMETHOD(ExitThread)(ULONG ExitCode) override
     {
+        if (GetCurrentThreadId() != mEventThreadId)
+            __debugbreak();
+
         logDebug("[{}] Thread exited", __func__);
         logDebug("  ExitCode: {:#x}", ExitCode);
 
@@ -575,6 +618,9 @@ public:
 
     STDMETHOD(CreateProcess)(ULONG64 ImageFileHandle, ULONG64 Handle, ULONG64 BaseOffset, ULONG ModuleSize, PCWSTR ModuleName, PCWSTR ImageName, ULONG CheckSum, ULONG TimeDateStamp, ULONG64 InitialThreadHandle, ULONG64 ThreadDataOffset, ULONG64 StartOffset) override
     {
+        if (GetCurrentThreadId() != mEventThreadId)
+            __debugbreak();
+
         logDebug("dwThreadId: {:#x}", GetCurrentThreadId());
         logDebug("[{}] Process created", __func__);
         logDebug("  ImageFileHandle: {:#x}", ImageFileHandle);
@@ -588,6 +634,14 @@ public:
         logDebug("  InitialThreadHandle: {:#x}", InitialThreadHandle);
         logDebug("  ThreadDataOffset: {:#x}", ThreadDataOffset);
         logDebug("  StartOffset: {:#x}", StartOffset);
+
+        if (gProcessInfo.dwProcessId == 0)
+        {
+            gProcessInfo.hProcess = (HANDLE)Handle;
+            gProcessInfo.hThread = (HANDLE)InitialThreadHandle;
+            gProcessInfo.dwProcessId = debugProcessId();
+            gProcessInfo.dwThreadId = debugThreadId();
+        }
 
         auto work = [=]
         {
@@ -610,14 +664,6 @@ public:
             // NOTE: unused by x64dbg (since winapi doesn't set it reliably)
             info.lpImageName = nullptr;
             info.fUnicode = 0;
-
-            if (gProcessInfo.dwProcessId == 0)
-            {
-                gProcessInfo.hProcess = info.hProcess;
-                gProcessInfo.hThread = info.hThread;
-                gProcessInfo.dwProcessId = debugProcessId();
-                gProcessInfo.dwThreadId = debugThreadId();
-            }
 
             // NOTE: Used by GetTEBLocation
             gProcessTebCache[info.hThread] = ThreadDataOffset;
@@ -690,6 +736,9 @@ public:
 
     STDMETHOD(ExitProcess)(ULONG ExitCode) override
     {
+        if (GetCurrentThreadId() != mEventThreadId)
+            __debugbreak();
+
         logDebug("[{}] Process exited", __func__);
         logDebug("  ExitCode: {:#x}", ExitCode);
 
@@ -708,6 +757,9 @@ public:
 
     STDMETHOD(LoadModule)(ULONG64 ImageFileHandle, ULONG64 BaseOffset, ULONG ModuleSize, PCWSTR ModuleName, PCWSTR ImageName, ULONG CheckSum, ULONG TimeDateStamp) override
     {
+        if (GetCurrentThreadId() != mEventThreadId)
+            __debugbreak();
+
         logDebug("[{}] Module loaded", __func__);
         logDebug("  ImageFileHandle: {:#x}", ImageFileHandle);
         logDebug("  BaseOffset: {:#x}", BaseOffset);
@@ -742,6 +794,9 @@ public:
 
     STDMETHOD(UnloadModule)(PCWSTR ImageBaseName, ULONG64 BaseOffset) override
     {
+        if (GetCurrentThreadId() != mEventThreadId)
+            __debugbreak();
+
         logDebug("[{}] Module unloaded", __func__);
         logDebug("  ImageBaseName: {}", ImageBaseName ? Utf16ToUtf8(ImageBaseName) : "<unknown>");
         logDebug("  BaseOffset: {:#x}", BaseOffset);
@@ -752,7 +807,9 @@ public:
             info.lpBaseOfDll = (LPVOID)BaseOffset;
             setFakeDebugEvent(info);
             gCustomHandlers.at(UE_CH_UNLOADDLL)(&info);
+            return true;
         };
+        queueCallback(std::move(work));
 
         return DEBUG_STATUS_BREAK;
     }
@@ -767,9 +824,12 @@ public:
 
     STDMETHOD(SessionStatus)(ULONG Status) override
     {
+        if (GetCurrentThreadId() != mEventThreadId)
+            __debugbreak();
+
         logDebug("[{}] Session status changed", __func__);
         logSingleFlag("Status", sessionFlags, Status);
-        return S_OK;
+        return S_OK; // ignored
     }
 
     STDMETHOD(ChangeDebuggeeState)(ULONG Flags, ULONG64 Argument) override
@@ -777,12 +837,16 @@ public:
         logDebug("[{}] Debuggee state changed", __func__);
         logSingleFlag("Flags", cdsFlags, Flags);
         logDebug("  Argument: {:#x}", Argument);
-        return DEBUG_STATUS_BREAK;
+        return S_OK; // ignored
     }
 
     STDMETHOD(ChangeEngineState)(ULONG Flags, ULONG64 Argument) override
     {
-        logDebug("[{}] Engine state changed", __func__);
+        // We do not expect this to be called on the dbgeng thread, except during initialization
+        if (GetCurrentThreadId() == mEventThreadId && gDbgEngInitialized)
+            __debugbreak();
+
+        logDebug("[{}] Engine state changed (tid: {}, apc: {}, debug: {})", __func__, GetCurrentThreadId(), mEventThreadId, gDebugThreadId);
         logBitFlag("Flags", cesFlags, Flags);
         logDebug("  Argument: {:#x}", Argument);
         if (Flags & DEBUG_CES_EXECUTION_STATUS)
@@ -790,14 +854,66 @@ public:
             if (Argument & DEBUG_STATUS_INSIDE_WAIT)
             {
                 logDebug("  DEBUG_STATUS_INSIDE_WAIT");
-                Argument &= ~DEBUG_STATUS_INSIDE_WAIT;
             }
             if (Argument & DEBUG_STATUS_WAIT_TIMEOUT)
             {
                 logDebug("  DEBUG_STATUS_WAIT_TIMEOUT");
-                Argument &= ~DEBUG_STATUS_WAIT_TIMEOUT;
             }
             logSingleFlag("Status", statusFlags, Argument);
+
+            // NOTE: ChangeEngineState is called multiple times for a state changes sometimes.
+            // The first time is when the state is changed using the API, the second time
+            // is when the debuggee actually enters the new state. We only want to see the
+            // latter, which happens while WaitForEvent is blocking on the debug thread.
+            // Calling StepInto on the debug thread also triggers ChangeEngineState, so
+            // we exclude that by checking the paused flag.
+            // TODO: likely this can be tracked using DEBUG_STATUS_INSIDE_WAIT too
+            if (!IsDebugThread() || gPaused)
+            {
+                logDebug("  [ignored state change]");
+                return S_OK;
+            }
+
+            switch (Argument & ~(DEBUG_STATUS_INSIDE_WAIT | DEBUG_STATUS_WAIT_TIMEOUT))
+            {
+            case DEBUG_STATUS_STEP_OVER:
+            case DEBUG_STATUS_STEP_INTO:
+            case DEBUG_STATUS_STEP_BRANCH:
+            case DEBUG_STATUS_REVERSE_STEP_OVER:
+            case DEBUG_STATUS_REVERSE_STEP_INTO:
+            case DEBUG_STATUS_REVERSE_STEP_BRANCH:
+            {
+                ULONG threadIndex = 0;
+                auto hr = gDebugSystemObjects->GetCurrentThreadId(&threadIndex);
+                if (FAILED(hr))
+                {
+                    logError("Failed to get current thread index: {:#x}", (uint32_t)hr);
+                    break;
+                }
+
+                auto itr = gStepCallbacks.find(threadIndex);
+                if (itr == gStepCallbacks.end())
+                {
+                    // NOTE: this always happens because the engine reports the state change twice
+                    logDebug("No step callback for thread index {}", threadIndex);
+                    break;
+                }
+
+                logDebug("Step callback for thread index {}", threadIndex);
+
+                auto callback = itr->second;
+                gStepCallbacks.erase(itr);
+
+                auto work = [callback]
+                {
+                    gNextExecutionStatus = DEBUG_STATUS_GO;
+                    callback();
+                    return true;
+                };
+                queueCallback(std::move(work));
+            }
+            break;
+            }
         }
         return S_OK;
     }
@@ -808,7 +924,7 @@ public:
         logBitFlag("Flags", cssFlags, Flags);
         logDebug("  Argument: {:#x}", Argument);
 
-        return DEBUG_STATUS_BREAK;
+        return S_OK; // ignored
     }
 };
 
@@ -993,7 +1109,7 @@ struct RegisterCache
         {
             if (Values[i].Type == DEBUG_VALUE_INVALID)
             {
-                logError("register[{}]: {} has DEBUG_VALUE_INVALID", i, Names[i]);
+                // logError("register[{}]: {} has DEBUG_VALUE_INVALID", i, Names[i]);
             }
         }
 
@@ -1075,60 +1191,20 @@ static RegisterCache gRegisterCache;
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
-static bool InitializeDbgEng()
+static HANDLE gDbgEngEvent = nullptr;
+static HANDLE gDbgEngThread = nullptr;
+
+static bool InitializeDbgEngImpl()
 {
-    static bool initialized = false;
-    if (initialized)
-        return true;
-
-    _plugin_logprintf = []
+    auto hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr))
     {
-#ifdef _WIN64
-        auto hModule = GetModuleHandleW(L"x64dbg.dll");
-#else
-        auto hModule = GetModuleHandleW(L"x32dbg.dll");
-#endif // _WIN64
-        if (hModule)
-        {
-            auto result = (decltype(&printf))GetProcAddress(hModule, "_plugin_logprintf");
-            if (result)
-                return result;
-        }
-        puts("Could not find _plugin_logprintf!");
-        return printf;
-    }();
-
-    wchar_t moduleDir[MAX_PATH] = {};
-    GetModuleFileNameW((HMODULE)&__ImageBase, moduleDir, std::size(moduleDir));
-
-    auto lastSlash = wcsrchr(moduleDir, L'\\');
-    if (lastSlash)
-        *(lastSlash + 1) = L'\0';
-
-    auto loadDll = [&moduleDir](const wchar_t* dllName) -> HMODULE
-    {
-        HMODULE hModule = GetModuleHandleW(dllName);
-        if (hModule)
-        {
-            logDebug("{} already loaded (might cause conflicts)", Utf16ToUtf8(dllName));
-            return hModule;
-        }
-
-        auto dllPath = std::wstring(moduleDir) + dllName;
-        hModule = LoadLibraryW(dllPath.c_str());
-        if (!hModule)
-        {
-            logError("Failed to load {}: {:#x}", Utf16ToUtf8(dllName), (uint32_t)GetLastError());
-        }
-        return hModule;
-    };
-    if (!loadDll(L"dbgmodel.dll"))
+        logError("Failed to initialize COM in dbgeng thread: {:#x}", (uint32_t)hr);
         return false;
-    if (!loadDll(L"dbgeng.dll"))
-        return false;
+    }
 
     // Create primary debug client interface
-    HRESULT hr = DebugCreate(__uuidof(IDebugClient9), reinterpret_cast<void**>(&gDebugClient));
+    hr = DebugCreate(__uuidof(IDebugClient9), reinterpret_cast<void**>(&gDebugClient));
     if (FAILED(hr))
     {
         logError("Failed to create IDebugClient9: {:#x}", (uint32_t)hr);
@@ -1190,7 +1266,109 @@ static bool InitializeDbgEng()
 
     logDebug("Initialization complete!");
 
-    initialized = true;
+    return true;
+}
+
+static bool InitializeDbgEng()
+{
+    if (gDbgEngInitialized)
+        return true;
+
+    _plugin_logprintf = []
+    {
+#ifdef _WIN64
+        auto hModule = GetModuleHandleW(L"x64dbg.dll");
+#else
+        auto hModule = GetModuleHandleW(L"x32dbg.dll");
+#endif // _WIN64
+        if (hModule)
+        {
+            auto result = (decltype(&printf))GetProcAddress(hModule, "_plugin_logprintf");
+            if (result)
+                return result;
+        }
+        puts("Could not find _plugin_logprintf!");
+        return printf;
+    }();
+
+    wchar_t moduleDir[MAX_PATH] = {};
+    GetModuleFileNameW((HMODULE)&__ImageBase, moduleDir, std::size(moduleDir));
+
+    auto lastSlash = wcsrchr(moduleDir, L'\\');
+    if (lastSlash)
+        *(lastSlash + 1) = L'\0';
+
+    auto loadDll = [&moduleDir](const wchar_t* dllName) -> HMODULE
+    {
+        HMODULE hModule = GetModuleHandleW(dllName);
+        if (hModule)
+        {
+            logDebug("{} already loaded (might cause conflicts)", Utf16ToUtf8(dllName));
+            return hModule;
+        }
+
+        auto dllPath = std::wstring(moduleDir) + dllName;
+        hModule = LoadLibraryW(dllPath.c_str());
+        if (!hModule)
+        {
+            logError("Failed to load {}: {:#x}", Utf16ToUtf8(dllName), (uint32_t)GetLastError());
+        }
+        return hModule;
+    };
+    if (!loadDll(L"dbgmodel.dll"))
+        return false;
+    if (!loadDll(L"dbgeng.dll"))
+        return false;
+
+    // TODO: wait for initialization to complete/fail
+    // NOTE: We initialize dbgeng on a separate thread because this thread is used to deliver
+    // events to and we do not want this in the UI thread.
+    auto dbgEngThreadProc = [](void* initEvent) -> DWORD
+    {
+        logDebug("dbgeng thread started");
+        gDbgEngInitialized = InitializeDbgEngImpl();
+        SetEvent((HANDLE)initEvent);
+
+        // Wait in an alertable state so that debug events can be delivered
+        while (true)
+        {
+            auto result = WaitForSingleObjectEx(gDbgEngEvent, 1, TRUE);
+            if (result == WAIT_OBJECT_0)
+            {
+                logDebug("dbgeng thread exiting");
+                break;
+            }
+            else if (result == WAIT_FAILED)
+            {
+                logError("WaitForSingleObjectEx failed in dbgeng thread: {:#x}", (uint32_t)GetLastError());
+                break;
+            }
+        }
+
+        // TODO: cleanup
+
+        // If the gDbgEngEvent is signaled, we should exit the thread
+        return 0;
+    };
+
+    auto initEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    gDbgEngEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    gDbgEngThread = CreateThread(nullptr, 0, dbgEngThreadProc, initEvent, 0, nullptr);
+    WaitForSingleObject(initEvent, INFINITE);
+    CloseHandle(initEvent);
+
+    if (!gDbgEngInitialized)
+    {
+        SetEvent(gDbgEngEvent);
+        WaitForSingleObject(gDbgEngThread, INFINITE);
+        CloseHandle(gDbgEngThread);
+        CloseHandle(gDbgEngEvent);
+        gDbgEngEvent = nullptr;
+        gDbgEngThread = nullptr;
+        logError("Failed to initialize dbgeng");
+        return false;
+    }
+
     return true;
 }
 
@@ -1321,7 +1499,7 @@ __declspec(dllexport) PROCESS_INFORMATION* InitDebugW(const wchar_t* szFileName,
         return nullptr;
     }
 
-    gDebugThread = GetCurrentThreadId();
+    gDebugThreadId = GetCurrentThreadId();
 
     return &gProcessInfo;
 }
@@ -1339,9 +1517,10 @@ __declspec(dllexport) void SetBPXOptions(TitanBreakpointType DefaultBreakPointTy
 
 __declspec(dllexport) bool IsBPXEnabled(ULONG_PTR bpxAddress)
 {
-    if (!IsDebugThread())
+    PauseLock pl;
+    if (!pl)
     {
-        logError("IsBPXEnabled called from non-debug thread!");
+        logError("IsBPXEnabled failed to acquire pause lock");
         return false;
     }
     for (const auto& [id, info] : gBreakpoints)
@@ -1354,10 +1533,11 @@ __declspec(dllexport) bool IsBPXEnabled(ULONG_PTR bpxAddress)
 
 __declspec(dllexport) bool SetBPX(ULONG_PTR bpxAddress, DWORD bpxType /* TitanSoftwareBreakpointType */, TITANCBSOFTBP bpxCallBack)
 {
-    if (!IsDebugThread())
+    PauseLock pl;
+    if (!pl)
     {
-        logError("SetBPX called from non-debug thread!");
-        __debugbreak();
+        logError("SetBPX failed to acquire pause lock");
+        return false;
     }
 
     BreakpointInfo info;
@@ -1401,8 +1581,21 @@ __declspec(dllexport) bool SetBPX(ULONG_PTR bpxAddress, DWORD bpxType /* TitanSo
 
 __declspec(dllexport) bool DeleteBPX(ULONG_PTR bpxAddress)
 {
-    __debugbreak();
-    return {};
+    for (const auto& [id, info] : gBreakpoints)
+    {
+        if (info.type == DEBUG_BREAKPOINT_CODE && info.offset == bpxAddress)
+        {
+            auto hr = gDebugControl->RemoveBreakpoint2(info.bp);
+            if (FAILED(hr))
+            {
+                logError("Failed to remove breakpoint: {:#x}", (uint32_t)hr);
+                return false;
+            }
+            gBreakpoints.erase(id);
+            return true;
+        }
+    }
+    return false;
 }
 
 __declspec(dllexport) bool SetMemoryBPXEx(ULONG_PTR MemoryStart, SIZE_T SizeOfMemory, TitanMemoryBreakpointType BreakPointType, bool RestoreOnHit, TITANCBMEMBP bpxCallBack)
@@ -1444,7 +1637,10 @@ __declspec(dllexport) bool GetFullContextDataEx(HANDLE hActiveThread, TITAN_ENGI
         return false;
     }
     if (threadIndex != currentIndex)
-        __debugbreak();
+    {
+        // TODO: thread switching
+        return false;
+    }
 
     titcontext->cax = gRegisterCache.GetValue(UE_RAX);
     titcontext->cbx = gRegisterCache.GetValue(UE_RBX);
@@ -1513,7 +1709,10 @@ __declspec(dllexport) ULONG_PTR GetContextDataEx(HANDLE hActiveThread, TitanRegi
         return 0;
     }
     if (threadIndex != currentIndex)
-        __debugbreak();
+    {
+        // TODO: implement thread switching
+        return 0;
+    }
     return gRegisterCache.GetValue(IndexOfRegister);
 }
 
@@ -1547,8 +1746,11 @@ __declspec(dllexport) bool GetAVXContext(HANDLE hActiveThread, TITAN_ENGINE_CONT
         return false;
     }
     if (threadIndex != currentIndex)
-        __debugbreak();
-    
+    {
+        // TODO: implement thread switching
+        return false;
+    }
+
     // TODO: implement xmm/ymm registers
 
     return true;
@@ -1606,14 +1808,42 @@ __declspec(dllexport) void SetCustomHandler(TitanCustomHandler ExceptionId, TITA
     gCustomHandlers[ExceptionId] = CallBack;
 }
 
+static void debugStep(ULONG status, TITANCBSTEP callback)
+{
+    PauseLock pl;
+    if (!pl)
+    {
+        logError("debugStep({}) failed to acquire pause lock", formatSingleFlag(statusFlags, status));
+        return;
+    }
+
+    ULONG threadIndex = 0;
+    auto hr = gDebugSystemObjects->GetCurrentProcessId(&threadIndex);
+    if (FAILED(hr))
+    {
+        logError("debugStep({}) Failed to get current thread index: {:#x}", formatSingleFlag(statusFlags, status), (uint32_t)hr);
+        return;
+    }
+
+    if (gStepCallbacks.contains(threadIndex))
+    {
+        logError("debugStep({}) called while another step is in progress on this thread", formatSingleFlag(statusFlags, status));
+        return;
+    }
+
+    gNextExecutionStatus = status;
+
+    gStepCallbacks.emplace(threadIndex, callback);
+}
+
 __declspec(dllexport) void StepInto(TITANCBSTEP traceCallBack)
 {
-    __debugbreak();
+    debugStep(DEBUG_STATUS_STEP_INTO, traceCallBack);
 }
 
 __declspec(dllexport) void StepOver(TITANCBSTEP traceCallBack)
 {
-    __debugbreak();
+    debugStep(DEBUG_STATUS_STEP_OVER, traceCallBack);
 }
 
 __declspec(dllexport) bool GetUnusedHardwareBreakPointRegister(LPDWORD RegisterIndex)
@@ -1636,8 +1866,25 @@ __declspec(dllexport) bool DeleteHardwareBreakPoint(DWORD IndexOfRegister)
 
 __declspec(dllexport) bool RemoveAllBreakPoints(TitanBreakpointRemoveOption RemoveOption)
 {
-    __debugbreak();
-    return {};
+    PauseLock pl;
+    if (!pl)
+    {
+        logError("RemoveAllBreakPoints failed to acquire pause lock");
+        return false;
+    }
+
+    for (const auto& [id, info] : gBreakpoints)
+    {
+        auto hr = gDebugControl->RemoveBreakpoint2(info.bp);
+        if (FAILED(hr))
+        {
+            logError("Failed to remove breakpoint {}: {:#x}", id, (uint32_t)hr);
+            return false;
+        }
+    }
+    gBreakpoints.clear();
+
+    return true;
 }
 
 __declspec(dllexport) void DebugLoop()
@@ -1646,17 +1893,39 @@ __declspec(dllexport) void DebugLoop()
         __debugbreak();
     logDebug("[{}] dwThreadId: {:#x}", __func__, GetCurrentThreadId());
 
-    gIsDebugging.store(true);
+    gIsDebugging = true;
     while (true)
     {
         // NOTE: The idea with gPaused and gMutexPaused is to allow other threads to read registers while we're paused
         // but while waiting for an event all those functions will fail instead.
-        gPaused.store(false);
-        auto hr = gDebugControl->WaitForEvent(DEBUG_WAIT_DEFAULT, INFINITE);
+        gPaused = false;
+        ULONG execStatusBefore = 0;
+        auto hr = gDebugControl->GetExecutionStatusEx(&execStatusBefore);
+        if (FAILED(hr))
+        {
+            logError("[WaitForEvent] Failed to get execution status: {:#x}", (uint32_t)hr);
+        }
+        else
+        {
+            logDebug("[WaitForEvent] ExecutionStatus (before): {}", formatSingleFlag(statusFlags, execStatusBefore));
+        }
+
+        hr = gDebugControl->WaitForEvent(DEBUG_WAIT_DEFAULT, INFINITE);
         if (FAILED(hr))
         {
             logError("Failed to wait for initial event: {:#x}", (uint32_t)hr);
             break;
+        }
+
+        ULONG execStatusAfter = 0;
+        hr = gDebugControl->GetExecutionStatusEx(&execStatusAfter);
+        if (FAILED(hr))
+        {
+            logError("[WaitForEvent] Failed to get execution status: {:#x}", (uint32_t)hr);
+        }
+        else
+        {
+            logDebug("[WaitForEvent] ExecutionStatus (after): {}", formatSingleFlag(statusFlags, execStatusAfter));
         }
 
         // We acquire the mutex here to ensure no other threads are using the cache
@@ -1669,7 +1938,7 @@ __declspec(dllexport) void DebugLoop()
         }
 
         // After this point other threads will fail before trying to even acquire the lock
-        gPaused.store(true);
+        gPaused = true;
 
         std::lock_guard lgQueue(gMutexCallbackQueue);
         if (gCallbackQueue.empty())
@@ -1697,8 +1966,17 @@ __declspec(dllexport) void DebugLoop()
                 break;
             }
         }
+        if (gNextExecutionStatus != DEBUG_STATUS_NO_CHANGE)
+        {
+            hr = gDebugControl->SetExecutionStatus(gNextExecutionStatus);
+            if (FAILED(hr))
+            {
+                logError("SetExecutionStatus({}) failed: {:#x}", formatSingleFlag(statusFlags, gNextExecutionStatus), (uint32_t)hr);
+            }
+            gNextExecutionStatus = DEBUG_STATUS_NO_CHANGE;
+        }
     }
-    gIsDebugging.store(false);
+    gIsDebugging = false;
 
     // Reset caches
     gProcessInfo = {};
@@ -1744,8 +2022,7 @@ __declspec(dllexport) bool DetachDebuggerEx(DWORD ProcessId)
 
 __declspec(dllexport) bool IsFileBeingDebugged()
 {
-    __debugbreak();
-    return {};
+    return gIsDebugging;
 }
 
 // TitanEngine.Process.functions:
@@ -1810,4 +2087,19 @@ __declspec(dllexport) bool EngineCheckStructAlignment(TitanStructureType Structu
     if (StructureType == UE_STRUCT_TITAN_ENGINE_CONTEXT)
         return StructureSize == sizeof(TITAN_ENGINE_CONTEXT_t);
     return false;
+}
+
+BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
+{
+    if (fdwReason == DLL_PROCESS_DETACH)
+    {
+        if (gDbgEngThread)
+        {
+            SetEvent(gDbgEngEvent);
+            WaitForSingleObject(gDbgEngThread, INFINITE);
+            CloseHandle(gDbgEngThread);
+            gDbgEngThread = nullptr;
+        }
+    }
+    return TRUE;
 }
