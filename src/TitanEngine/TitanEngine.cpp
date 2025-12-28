@@ -12,6 +12,11 @@
 #include <DbgEng.h>
 #include <delayimp.h>
 #include <atlbase.h>
+
+// https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/debugging-session-and-execution-model
+// https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/introduction
+// https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/dbgeng/nf-dbgeng-idebugcontrol3-waitforevent
+
 using namespace ATL;
 
 static decltype(&printf) _plugin_logprintf;
