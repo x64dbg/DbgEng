@@ -1,6 +1,14 @@
 # Simple Command-Line Debugger
 
-A simple command-line debugger built using Microsoft's DbgEng API. This debugger provides basic debugging functionality for Windows executables.
+A DbgEng-based debugger and TitanEngine-compatible backend for x64dbg. The
+`playground` target provides a small command-line debugger; the `TitanEngine`
+target is the compatibility shim consumed by x64dbg.
+
+The shim currently supports live x64 launch and attach sessions, x64dbg event
+translation, software breakpoints, stepping, memory operations, general
+registers, non-current thread selection, repeatable sessions, and common
+process/thread controls. Memory/hardware breakpoints and AVX/AVX-512 transfer
+return normal unsupported results rather than interrupting the debugger.
 
 ## Features
 
@@ -25,6 +33,11 @@ cmake --build build
 ```bash
 copy dbgeng\*.dll build\Debug\
 ```
+
+When the shim is loaded by x64dbg, x64dbg's root `dbghelp.dll` must match this
+DbgEng distribution. Windows binds DbgEng to an already-loaded `dbghelp.dll`;
+an older x64dbg copy causes `LoadLibrary(dbgeng.dll)` to fail with
+`ERROR_PROC_NOT_FOUND`.
 
 ## Usage
 

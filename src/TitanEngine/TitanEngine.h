@@ -19,13 +19,9 @@ enum TitanAccessType
     UE_ACCESS_ALL = 2,
 };
 
-enum TitanHideLevel
-{
-    UE_HIDE_PEBONLY = 0,
-};
-
 enum TitanEngineVariable
 {
+    UE_ENGINE_NO_CONSOLE_WINDOW = 4,
     UE_ENGINE_SET_DEBUG_PRIVILEGE = 9,
     UE_ENGINE_SAFE_ATTACH = 10,
     UE_ENGINE_MEMBP_ALT = 11,
@@ -310,15 +306,15 @@ extern "C"
 #endif
 
 // Global.Function.Declaration:
-// TitanEngine.Dumper.functions:
-__declspec(dllexport) ULONG_PTR ConvertVAtoFileOffsetEx(ULONG_PTR FileMapVA, DWORD FileSize, ULONG_PTR ImageBase, ULONG_PTR AddressToConvert, bool AddressIsRVA, bool ReturnType); // TODO: remove
-__declspec(dllexport) ULONG_PTR ConvertFileOffsetToVA(ULONG_PTR FileMapVA, ULONG_PTR AddressToConvert, bool ReturnType); // TODO: remove
 __declspec(dllexport) bool MemoryReadSafe(HANDLE hProcess, LPVOID lpBaseAddress, LPVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesRead);
 __declspec(dllexport) bool MemoryWriteSafe(HANDLE hProcess, LPVOID lpBaseAddress, LPCVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesWritten);
+__declspec(dllexport) SIZE_T MemoryQuerySafe(HANDLE hProcess, LPCVOID lpAddress, PMEMORY_BASIC_INFORMATION lpBuffer, SIZE_T dwLength);
+__declspec(dllexport) LPVOID MemoryAllocSafe(HANDLE hProcess, LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect);
+__declspec(dllexport) bool MemoryFreeSafe(HANDLE hProcess, LPVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType);
+__declspec(dllexport) bool MemoryProtectSafe(HANDLE hProcess, LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect);
 // TitanEngine.Hider.functions:
 __declspec(dllexport) ULONG_PTR GetPEBLocation(HANDLE hProcess);
 __declspec(dllexport) ULONG_PTR GetTEBLocation(HANDLE hThread);
-__declspec(dllexport) bool HideDebugger(HANDLE hProcess, TitanHideLevel HideLevel); // TODO: remove
 // TitanEngine.Debugger.functions:
 __declspec(dllexport) PROCESS_INFORMATION* InitDebugW(const wchar_t* szFileName, const wchar_t* szCommandLine, const wchar_t* szCurrentFolder);
 __declspec(dllexport) bool StopDebug();
@@ -336,7 +332,6 @@ __declspec(dllexport) bool GetAVXContext(HANDLE hActiveThread, TITAN_ENGINE_CONT
 __declspec(dllexport) bool SetAVXContext(HANDLE hActiveThread, TITAN_ENGINE_CONTEXT_t* titcontext);
 __declspec(dllexport) bool GetAVX512Context(HANDLE hActiveThread, TITAN_ENGINE_CONTEXT_AVX512_t* titcontext);
 __declspec(dllexport) bool SetAVX512Context(HANDLE hActiveThread, TITAN_ENGINE_CONTEXT_AVX512_t* titcontext);
-__declspec(dllexport) bool Fill(LPVOID MemoryStart, DWORD MemorySize, PBYTE FillByte); // TODO: remove
 __declspec(dllexport) const DEBUG_EVENT* GetDebugData(); // TODO: remove?
 __declspec(dllexport) void SetCustomHandler(TitanCustomHandler ExceptionId, TITANCALLBACKARG CallBack);
 __declspec(dllexport) void StepInto(TITANCBSTEP traceCallBack);
@@ -353,9 +348,19 @@ __declspec(dllexport) bool IsFileBeingDebugged();
 // TitanEngine.Process.functions:
 __declspec(dllexport) HANDLE TitanOpenProcess(DWORD dwDesiredAccess, bool bInheritHandle, DWORD dwProcessId);
 __declspec(dllexport) HANDLE TitanOpenThread(DWORD dwDesiredAccess, bool bInheritHandle, DWORD dwThreadId);
-// TitanEngine.StaticUnpacker.functions:
-__declspec(dllexport) bool StaticFileLoadW(const wchar_t* szFileName, DWORD DesiredAccess, bool SimulateLoad, LPHANDLE FileHandle, LPDWORD LoadedSize, LPHANDLE FileMap, PULONG_PTR FileMapVA); // TODO: remove
-__declspec(dllexport) bool StaticFileUnloadW(const wchar_t* szFileName, bool CommitChanges, HANDLE FileHandle, DWORD LoadedSize, HANDLE FileMap, ULONG_PTR FileMapVA); // TODO: remove
+__declspec(dllexport) bool TitanCloseHandle(HANDLE hEngineHandle);
+__declspec(dllexport) bool ProcessIsWow64(HANDLE hProcess, PBOOL isWow64);
+__declspec(dllexport) bool TitanTerminateProcess(HANDLE hProcess, DWORD exitCode);
+__declspec(dllexport) bool TitanDebugBreakProcess(HANDLE hProcess);
+__declspec(dllexport) HANDLE TitanCreateRemoteThread(HANDLE hProcess, LPTHREAD_START_ROUTINE start, LPVOID argument, DWORD creationFlags, LPDWORD threadId);
+__declspec(dllexport) DWORD TitanSuspendThread(HANDLE hThread);
+__declspec(dllexport) DWORD TitanResumeThread(HANDLE hThread);
+__declspec(dllexport) bool TitanTerminateThread(HANDLE hThread, DWORD exitCode);
+__declspec(dllexport) DWORD TitanGetThreadId(HANDLE hThread);
+__declspec(dllexport) int TitanGetThreadPriority(HANDLE hThread);
+__declspec(dllexport) bool TitanSetThreadPriority(HANDLE hThread, int priority);
+__declspec(dllexport) bool TitanGetThreadTimes(HANDLE hThread, LPFILETIME creation, LPFILETIME exit, LPFILETIME kernel, LPFILETIME user);
+__declspec(dllexport) bool TitanQueryThreadCycleTime(HANDLE hThread, PULONG64 cycleTime);
 // TitanEngine.Engine.functions:
 __declspec(dllexport) void SetEngineVariable(TitanEngineVariable VariableId, bool VariableSet);
 __declspec(dllexport) bool EngineCheckStructAlignment(TitanStructureType StructureType, ULONG_PTR StructureSize);
