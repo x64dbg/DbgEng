@@ -26,10 +26,17 @@ compile-features = ["cxx_std_20"]
 type = "shared"
 sources = [
 	"src/TitanEngine/TitanEngine.cpp",
+	"src/TTD/TTD.cpp",
+	"src/TTD/sha256.cpp",
+	"src/TTD/utils.cpp",
 ]
 headers = [
 	"src/TitanEngine/TitanEngine.h",
 	"src/TitanEngine/FileMap.h",
+	"src/TTD/TTD.hpp",
+	"src/TTD/csts.h",
+	"src/TTD/sha256.h",
+	"src/TTD/utils.h",
 ]
 compile-features = ["cxx_std_20"]
 link-libraries = ["DbgEng", "Delayimp"]

@@ -118,6 +118,13 @@ endif()
 # Target: TitanEngine
 set(TitanEngine_SOURCES
 	cmake.toml
+	"src/TTD/TTD.cpp"
+	"src/TTD/TTD.hpp"
+	"src/TTD/csts.h"
+	"src/TTD/sha256.cpp"
+	"src/TTD/sha256.h"
+	"src/TTD/utils.cpp"
+	"src/TTD/utils.h"
 	"src/TitanEngine/FileMap.h"
 	"src/TitanEngine/TitanEngine.cpp"
 	"src/TitanEngine/TitanEngine.h"

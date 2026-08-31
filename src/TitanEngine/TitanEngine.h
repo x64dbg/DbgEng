@@ -58,6 +58,12 @@ typedef struct
     DWORD reserved;
 } TITAN_SESSION_INFO;
 
+typedef struct
+{
+    uint64_t sequence;
+    uint64_t steps;
+} TITAN_REPLAY_POSITION;
+
 enum TitanEngineVariable
 {
     UE_ENGINE_NO_CONSOLE_WINDOW = 4,
@@ -359,6 +365,11 @@ __declspec(dllexport) ULONG_PTR GetTEBLocation(HANDLE hThread);
 __declspec(dllexport) PROCESS_INFORMATION* InitDebugW(const wchar_t* szFileName, const wchar_t* szCommandLine, const wchar_t* szCurrentFolder);
 __declspec(dllexport) PROCESS_INFORMATION* InitReplayW(const wchar_t* szArtifactPath, TitanSessionKind ExpectedKind);
 __declspec(dllexport) bool GetSessionInfo(TITAN_SESSION_INFO* SessionInfo);
+__declspec(dllexport) bool ReplayGetPosition(TITAN_REPLAY_POSITION* Position);
+__declspec(dllexport) bool ReplayGetExtent(TITAN_REPLAY_POSITION* First, TITAN_REPLAY_POSITION* Last);
+__declspec(dllexport) bool ReplaySetPosition(const TITAN_REPLAY_POSITION* Position);
+__declspec(dllexport) bool ReplayRun(bool Reverse);
+__declspec(dllexport) bool ReplayStep(bool Reverse, bool StepOver, TITANCBSTEP StepCallBack);
 __declspec(dllexport) bool StopDebug();
 __declspec(dllexport) void SetBPXOptions(TitanBreakpointType DefaultBreakPointType);
 __declspec(dllexport) bool IsBPXEnabled(ULONG_PTR bpxAddress);

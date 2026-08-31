@@ -4,11 +4,17 @@
 #include <mutex>
 #include <queue>
 #include <set>
+#include <tuple>
 #include <functional>
 #include <atomic>
+#include <algorithm>
+#include <condition_variable>
+#include <memory>
+#include <chrono>
 
 #include "TitanEngine.h"
 #include "FileMap.h"
+#include "../TTD/TTD.hpp"
 
 #include <DbgEng.h>
 #include <delayimp.h>
@@ -279,6 +285,32 @@ static bool gComInitialized = false;
 static HANDLE gProcessCreatedEvent = nullptr;
 static const char* gSyntheticDebugString = nullptr;
 static SIZE_T gSyntheticDebugStringSize = 0;
+static std::unique_ptr<TTD::ReplayEngine> gTtdEngine;
+static std::unique_ptr<TTD::Cursor> gTtdCursor;
+static TTD::Position gTtdFirstPosition = {};
+static TTD::Position gTtdLastPosition = {};
+static DWORD gTtdProcessId = 1;
+static DWORD gTtdCurrentThreadId = 0;
+static DWORD gTtdMachineType = 0;
+static std::wstring gTtdImagePath;
+static std::map<ULONG64, std::wstring> gTtdActiveModules;
+static std::mutex gTtdMovementMutex;
+static std::condition_variable gTtdMovementCondition;
+static bool gTtdStopRequested = false;
+static bool gTtdCursorChanged = false;
+static bool gTtdNextRunReverse = false;
+struct TtdWatchHit
+{
+    bool pending = false;
+    ULONG64 address = 0;
+    ULONG64 size = 0;
+    ULONG64 flags = 0;
+    ULONG64 sequence = 0;
+    ULONG64 steps = 0;
+    ULONG uniqueThreadId = 0;
+    DWORD threadId = 0;
+};
+static TtdWatchHit gTtdWatchHit;
 
 /* DbgEng interfaces:
 #define INTERFACE IDebugAdvanced4
@@ -427,8 +459,27 @@ static void dispatchSystemBreakpoint(const void* argument)
     finishDebugEvent(false);
 }
 
+static void resetTtdSession()
+{
+    gTtdCursor.reset();
+    gTtdEngine.reset();
+    gTtdFirstPosition = {};
+    gTtdLastPosition = {};
+    gTtdProcessId = 1;
+    gTtdCurrentThreadId = 0;
+    gTtdMachineType = 0;
+    gTtdImagePath.clear();
+    gTtdActiveModules.clear();
+    gTtdStopRequested = false;
+    gTtdCursorChanged = false;
+    gTtdNextRunReverse = false;
+    gTtdWatchHit = {};
+}
+
 static DWORD debugProcessId()
 {
+    if (gSessionKind == UE_SESSION_TTD)
+        return gTtdProcessId;
     if (!gDebugSystemObjects)
         return 0;
     ULONG id = 0;
@@ -439,6 +490,8 @@ static DWORD debugProcessId()
 
 static DWORD debugThreadId()
 {
+    if (gSessionKind == UE_SESSION_TTD)
+        return gTtdCurrentThreadId;
     if (!gDebugSystemObjects)
         return 0;
     ULONG id = 0;
@@ -621,11 +674,35 @@ static bool protectMemoryBreakpointPage(ULONG_PTR page, bool guarded)
     return true;
 }
 
+static ULONG64 ttdMemoryWatchFlags(TitanMemoryBreakpointType type)
+{
+    switch (type)
+    {
+    case UE_MEMORY_READ: return TTD::BP_FLAGS::READ;
+    case UE_MEMORY_WRITE: return TTD::BP_FLAGS::WRITE;
+    case UE_MEMORY_EXECUTE: return TTD::BP_FLAGS::EXEC;
+    default: return TTD::BP_FLAGS::READ | TTD::BP_FLAGS::WRITE | TTD::BP_FLAGS::EXEC;
+    }
+}
+
 static bool removeMemoryBreakpointById(uint64_t id)
 {
     auto breakpoint = gMemoryBreakpoints.find(id);
     if (breakpoint == gMemoryBreakpoints.end())
         return false;
+
+    if (gSessionKind == UE_SESSION_TTD)
+    {
+        TTD::TTD_Replay_MemoryWatchpointData watchpoint {
+            breakpoint->second.start,
+            breakpoint->second.size,
+            ttdMemoryWatchFlags(breakpoint->second.type),
+        };
+        const auto result = gTtdCursor && gTtdCursor->RemoveMemoryWatchpoint(&watchpoint);
+        if (result)
+            gMemoryBreakpoints.erase(breakpoint);
+        return result;
+    }
 
     const auto startPage = pageAddress(breakpoint->second.start);
     const auto endPage = pageAddress(breakpoint->second.start + breakpoint->second.size - 1);
@@ -1259,61 +1336,64 @@ public:
             // NOTE: Used by GetTEBLocation
             gProcessTebCache[info.hThread] = ThreadDataOffset;
 
-            HRESULT hr = {};
+            if (gSessionKind != UE_SESSION_TTD)
             {
-                ULONG processIndex = 0;
-                hr = gDebugSystemObjects->GetCurrentProcessId(&processIndex);
+                HRESULT hr = {};
+                {
+                    ULONG processIndex = 0;
+                    hr = gDebugSystemObjects->GetCurrentProcessId(&processIndex);
+                    if (FAILED(hr))
+                    {
+                        logError("Failed to get event process index");
+                        processIndex = -1;
+                    }
+                    gDebugIdMap.processHandleToIndex[info.hProcess] = processIndex;
+                    gDebugIdMap.processIndexToHandle[processIndex] = info.hProcess;
+                    if (gSessionKind == UE_SESSION_LIVE)
+                    {
+                        registerTitanHandle(info.hProcess, TitanHandleType::Process, processIndex, debugProcessId(), false);
+
+                        // NOTE: sanity check
+                        ULONG handleIndex = 0;
+                        hr = gDebugSystemObjects->GetProcessIdByHandle(Handle, &handleIndex);
+                        if (FAILED(hr))
+                            logError("Failed to get event process index by handle");
+                        else if (handleIndex != processIndex)
+                            logError("Process index mismatch: current {}, handle {}", processIndex, handleIndex);
+                    }
+                }
+                {
+                    ULONG threadIndex = 0;
+                    hr = gDebugSystemObjects->GetCurrentThreadId(&threadIndex);
+                    if (FAILED(hr))
+                    {
+                        logError("Failed to get event thread index");
+                        threadIndex = -1;
+                    }
+                    gDebugIdMap.threadHandleToIndex[info.hThread] = threadIndex;
+                    gDebugIdMap.threadIndexToHandle[threadIndex] = info.hThread;
+                    if (gSessionKind == UE_SESSION_LIVE)
+                    {
+                        registerTitanHandle(info.hThread, TitanHandleType::Thread, threadIndex, debugThreadId(), false);
+
+                        // NOTE: sanity check
+                        ULONG handleIndex = 0;
+                        hr = gDebugSystemObjects->GetThreadIdByHandle(InitialThreadHandle, &handleIndex);
+                        if (FAILED(hr))
+                            logError("Failed to get event thread index by handle");
+                    }
+                }
+
+                // NOTE: Used by GetPEBLocation
+                ULONG64 peb = 0;
+                hr = gDebugSystemObjects->GetCurrentProcessPeb(&peb);
                 if (FAILED(hr))
                 {
-                    logError("Failed to get event process index");
-                    processIndex = -1;
+                    logError("Failed to get PEB from GetCurrentProcessPeb: {:#x}", (uint32_t)hr);
+                    peb = 0;
                 }
-                gDebugIdMap.processHandleToIndex[info.hProcess] = processIndex;
-                gDebugIdMap.processIndexToHandle[processIndex] = info.hProcess;
-                if (gSessionKind == UE_SESSION_LIVE)
-                {
-                    registerTitanHandle(info.hProcess, TitanHandleType::Process, processIndex, debugProcessId(), false);
-
-                    // NOTE: sanity check
-                    ULONG handleIndex = 0;
-                    hr = gDebugSystemObjects->GetProcessIdByHandle(Handle, &handleIndex);
-                    if (FAILED(hr))
-                        logError("Failed to get event process index by handle");
-                    else if (handleIndex != processIndex)
-                        logError("Process index mismatch: current {}, handle {}", processIndex, handleIndex);
-                }
+                gProcessPebCache[info.hProcess] = peb;
             }
-            {
-                ULONG threadIndex = 0;
-                hr = gDebugSystemObjects->GetCurrentThreadId(&threadIndex);
-                if (FAILED(hr))
-                {
-                    logError("Failed to get event thread index");
-                    threadIndex = -1;
-                }
-                gDebugIdMap.threadHandleToIndex[info.hThread] = threadIndex;
-                gDebugIdMap.threadIndexToHandle[threadIndex] = info.hThread;
-                if (gSessionKind == UE_SESSION_LIVE)
-                {
-                    registerTitanHandle(info.hThread, TitanHandleType::Thread, threadIndex, debugThreadId(), false);
-
-                    // NOTE: sanity check
-                    ULONG handleIndex = 0;
-                    hr = gDebugSystemObjects->GetThreadIdByHandle(InitialThreadHandle, &handleIndex);
-                    if (FAILED(hr))
-                        logError("Failed to get event thread index by handle");
-                }
-            }
-
-            // NOTE: Used by GetPEBLocation
-            ULONG64 peb = 0;
-            hr = gDebugSystemObjects->GetCurrentProcessPeb(&peb);
-            if (FAILED(hr))
-            {
-                logError("Failed to get PEB from GetCurrentProcessPeb: {:#x}", (uint32_t)hr);
-                peb = 0;
-            }
-            gProcessPebCache[info.hProcess] = peb;
 
             setFakeDebugEvent(info);
             dispatchDebugEvent(UE_CH_CREATEPROCESS, &info);
@@ -2300,6 +2380,21 @@ __declspec(dllexport) bool MemoryReadUnsafe(HANDLE hProcess, LPCVOID lpBaseAddre
         return false;
     }
 
+    if (gSessionKind == UE_SESSION_TTD)
+    {
+        if (!gTtdCursor || !gDebugIdMap.processHandleToIndex.contains(hProcess) || nSize > ULONG_MAX)
+        {
+            SetLastError(!gTtdCursor ? ERROR_INVALID_HANDLE : ERROR_INVALID_PARAMETER);
+            return false;
+        }
+        const auto result = gTtdCursor->ReadMemory((ULONG64)(ULONG_PTR)lpBaseAddress, lpBuffer, nSize);
+        if (lpNumberOfBytesRead)
+            *lpNumberOfBytesRead = result ? nSize : 0;
+        if (!result)
+            SetLastError(ERROR_PARTIAL_COPY);
+        return result;
+    }
+
     auto itr = gDebugIdMap.processHandleToIndex.find(hProcess);
     if (itr == gDebugIdMap.processHandleToIndex.end())
     {
@@ -2440,7 +2535,79 @@ __declspec(dllexport) SIZE_T MemoryQuerySafe(HANDLE hProcess, LPCVOID lpAddress,
         SetLastError(ERROR_INVALID_PARAMETER);
         return 0;
     }
-    if (gSessionKind == UE_SESSION_MINIDUMP || gSessionKind == UE_SESSION_TTD)
+    if (gSessionKind == UE_SESSION_TTD)
+    {
+        PauseLock pl;
+        if (!pl || !gTtdCursor || !gDebugIdMap.processHandleToIndex.contains(hProcess))
+        {
+            SetLastError(pl ? ERROR_INVALID_HANDLE : ERROR_BUSY);
+            return 0;
+        }
+        const auto address = (ULONG64)(ULONG_PTR)lpAddress;
+        const auto modules = gTtdCursor->GetModuleList();
+        const auto moduleCount = gTtdCursor->GetModuleCount();
+        std::vector<std::pair<ULONG64, ULONG64>> ranges;
+        ranges.reserve((size_t)moduleCount);
+        for (size_t i = 0; modules && i < moduleCount; ++i)
+        {
+            if (!modules[i].module || !modules[i].module->imageSize)
+                continue;
+            const auto start = modules[i].module->base_addr;
+            const auto end = start + modules[i].module->imageSize;
+            ranges.emplace_back(start, end);
+            if (address >= start && address < end)
+            {
+                *lpBuffer = {};
+                lpBuffer->BaseAddress = (PVOID)(ULONG_PTR)start;
+                lpBuffer->AllocationBase = (PVOID)(ULONG_PTR)start;
+                lpBuffer->AllocationProtect = PAGE_EXECUTE_READ;
+                lpBuffer->RegionSize = (SIZE_T)(end - start);
+                lpBuffer->State = MEM_COMMIT;
+                lpBuffer->Protect = PAGE_EXECUTE_READ;
+                lpBuffer->Type = MEM_IMAGE;
+                return sizeof(*lpBuffer);
+            }
+        }
+
+        const auto page = address & ~0xFFFull;
+        BYTE probe = 0;
+        if (gTtdCursor->ReadMemory(address, &probe, 1))
+        {
+            *lpBuffer = {};
+            lpBuffer->BaseAddress = (PVOID)(ULONG_PTR)page;
+            lpBuffer->AllocationBase = (PVOID)(ULONG_PTR)page;
+            lpBuffer->AllocationProtect = PAGE_READWRITE;
+            lpBuffer->RegionSize = 0x1000;
+            lpBuffer->State = MEM_COMMIT;
+            lpBuffer->Protect = PAGE_READWRITE;
+            lpBuffer->Type = MEM_PRIVATE;
+            return sizeof(*lpBuffer);
+        }
+
+        std::ranges::sort(ranges);
+#ifdef _WIN64
+        constexpr ULONG64 maximumAddress = 0x0000800000000000ull;
+#else
+        constexpr ULONG64 maximumAddress = 0x80000000ull;
+#endif
+        auto next = maximumAddress;
+        for (const auto& range : ranges)
+        {
+            if (range.first > address)
+            {
+                next = range.first;
+                break;
+            }
+        }
+        *lpBuffer = {};
+        lpBuffer->BaseAddress = (PVOID)(ULONG_PTR)page;
+        lpBuffer->AllocationBase = nullptr;
+        lpBuffer->RegionSize = (SIZE_T)((std::max<ULONG64>)(0x1000, next - page));
+        lpBuffer->State = MEM_FREE;
+        lpBuffer->Protect = PAGE_NOACCESS;
+        return sizeof(*lpBuffer);
+    }
+    if (gSessionKind == UE_SESSION_MINIDUMP)
     {
         PauseLock pl;
         if (!pl || !gDebugIdMap.processHandleToIndex.contains(hProcess))
@@ -2613,6 +2780,24 @@ __declspec(dllexport) PROCESS_INFORMATION* InitDebugW(const wchar_t* szFileName,
     return &gProcessInfo;
 }
 
+static bool __fastcall ttdMemoryWatchpointCallback(TTD::CallbackValue, const TTD::TTD_Replay_MemoryWatchpointResult* result,
+                                                    TTD::TTD_Replay_IThreadView* threadView)
+{
+    if (!result || !threadView || !threadView->IThreadView)
+        return false;
+    const auto thread = threadView->IThreadView->GetThreadInfo(threadView);
+    const auto position = threadView->IThreadView->GetPosition(threadView);
+    gTtdWatchHit.pending = true;
+    gTtdWatchHit.address = result->addr;
+    gTtdWatchHit.size = result->size;
+    gTtdWatchHit.flags = result->flags;
+    gTtdWatchHit.sequence = position ? position->Major : 0;
+    gTtdWatchHit.steps = position ? position->Minor : 0;
+    gTtdWatchHit.uniqueThreadId = thread ? thread->unk1 : 0;
+    gTtdWatchHit.threadId = thread ? thread->threadid : 0;
+    return true;
+}
+
 __declspec(dllexport) PROCESS_INFORMATION* InitReplayW(const wchar_t* szArtifactPath, TitanSessionKind ExpectedKind)
 {
     if (!szArtifactPath || !*szArtifactPath ||
@@ -2655,6 +2840,7 @@ __declspec(dllexport) PROCESS_INFORMATION* InitReplayW(const wchar_t* szArtifact
         gProcessPebCache = {};
         gProcessTebCache = {};
         closeCallerOwnedTitanHandles();
+        resetTtdSession();
         gSessionKind = UE_SESSION_NONE;
         const auto error = FAILED(hr) && HRESULT_FACILITY(hr) == FACILITY_WIN32 && HRESULT_CODE(hr)
                                ? HRESULT_CODE(hr)
@@ -2662,6 +2848,150 @@ __declspec(dllexport) PROCESS_INFORMATION* InitReplayW(const wchar_t* szArtifact
         SetLastError(error);
         return nullptr;
     };
+
+    if (ExpectedKind == UE_SESSION_TTD)
+    {
+        try
+        {
+            gTtdEngine = std::make_unique<TTD::ReplayEngine>();
+            if (!gTtdEngine->Initialize(szArtifactPath))
+            {
+                logError("TTD replay engine rejected the trace");
+                return fail(E_FAIL, ERROR_BAD_FORMAT);
+            }
+            gTtdFirstPosition = *gTtdEngine->GetFirstPosition();
+            gTtdLastPosition = *gTtdEngine->GetLastPosition();
+            gTtdCursor = std::make_unique<TTD::Cursor>(gTtdEngine->NewCursor());
+            gTtdCursor->SetMemoryWatchpointCallback(ttdMemoryWatchpointCallback, 0);
+            gTtdCursor->SetPosition(&gTtdFirstPosition);
+        }
+        catch (const std::exception& exception)
+        {
+            logError("Failed to initialize TTD replay: {}", exception.what());
+            return fail(E_FAIL, ERROR_NOT_SUPPORTED);
+        }
+
+        const auto peb = gTtdEngine->GetPebAddress();
+        gTtdMachineType = peb > UINT32_MAX ? IMAGE_FILE_MACHINE_AMD64 : IMAGE_FILE_MACHINE_I386;
+#ifdef _WIN64
+        if (gTtdMachineType != IMAGE_FILE_MACHINE_AMD64)
+#else
+        if (gTtdMachineType != IMAGE_FILE_MACHINE_I386)
+#endif
+        {
+            logError("TTD trace architecture does not match the adapter");
+            return fail(HRESULT_FROM_WIN32(ERROR_EXE_MACHINE_TYPE_MISMATCH), ERROR_EXE_MACHINE_TYPE_MISMATCH);
+        }
+
+        const auto activeThreadCount = gTtdCursor->GetThreadCount();
+        const auto activeThreads = gTtdCursor->GetThreadList();
+        const auto currentThread = gTtdCursor->GetThreadInfo();
+        if (!activeThreadCount || !activeThreads || !currentThread)
+        {
+            logError("TTD trace has no active bootstrap thread");
+            return fail(E_FAIL, ERROR_BAD_FORMAT);
+        }
+        gTtdCurrentThreadId = currentThread->threadid;
+
+        const auto modules = gTtdCursor->GetModuleList();
+        const auto moduleCount = gTtdCursor->GetModuleCount();
+        if (!modules || !moduleCount)
+        {
+            logError("TTD trace has no bootstrap modules");
+            return fail(E_FAIL, ERROR_BAD_FORMAT);
+        }
+        size_t mainModule = 0;
+        for (size_t i = 0; i < moduleCount; ++i)
+        {
+            const auto module = modules[i].module;
+            if (!module || !module->path)
+                continue;
+            std::wstring path(module->path, module->path_len);
+            const auto slash = path.find_last_of(L"\\/");
+            const auto name = path.substr(slash == std::wstring::npos ? 0 : slash + 1);
+            if (name.size() >= 4 && _wcsicmp(name.c_str() + name.size() - 4, L".exe") == 0)
+            {
+                mainModule = i;
+                gTtdImagePath = std::move(path);
+                break;
+            }
+        }
+        if (gTtdImagePath.empty() && modules[mainModule].module && modules[mainModule].module->path)
+            gTtdImagePath.assign(modules[mainModule].module->path, modules[mainModule].module->path_len);
+        for (size_t i = 0; i < moduleCount; ++i)
+        {
+            const auto module = modules[i].module;
+            if (module && module->path)
+                gTtdActiveModules[module->base_addr] = std::wstring(module->path, module->path_len);
+        }
+
+        constexpr ULONG processIndex = 0;
+        const auto processSystemId = gTtdProcessId;
+        const auto threadIndex = currentThread->unk1;
+        const auto threadSystemId = currentThread->threadid;
+        const auto eventProcess = createSyntheticTitanHandle(TitanHandleType::Process, processIndex, processSystemId, false);
+        const auto eventThread = createSyntheticTitanHandle(TitanHandleType::Thread, threadIndex, threadSystemId, false);
+        gDebugIdMap.processIndexToHandle[processIndex] = eventProcess;
+        gDebugIdMap.processHandleToIndex[eventProcess] = processIndex;
+        gDebugIdMap.threadIndexToHandle[threadIndex] = eventThread;
+        gDebugIdMap.threadHandleToIndex[eventThread] = threadIndex;
+        gProcessPebCache[eventProcess] = peb;
+        const auto teb = gTtdCursor->GetTebAddress(threadSystemId);
+        gProcessTebCache[eventThread] = teb;
+
+        const auto image = modules[mainModule].module;
+        const auto imageBase = image ? image->base_addr : 0;
+        const auto instruction = gTtdCursor->GetProgramCounter();
+        gProcessInfo.hProcess = eventProcess;
+        gProcessInfo.hThread = eventThread;
+        gProcessInfo.dwProcessId = processSystemId;
+        gProcessInfo.dwThreadId = threadSystemId;
+        gSessionKind = UE_SESSION_TTD;
+
+        gEventCallbacks->CreateProcess(0, (ULONG64)(uintptr_t)eventProcess, imageBase,
+                                       image ? (ULONG)image->imageSize : 0,
+                                       nullptr, gTtdImagePath.c_str(), image ? image->checkSum : 0, 0,
+                                       (ULONG64)(uintptr_t)eventThread, teb, instruction);
+        for (size_t i = 0; i < activeThreadCount; ++i)
+        {
+            const auto info = activeThreads[i].info;
+            if (!info || info->threadid == threadSystemId)
+                continue;
+            const auto token = createSyntheticTitanHandle(TitanHandleType::Thread, info->unk1, info->threadid, false);
+            gDebugIdMap.threadIndexToHandle[info->unk1] = token;
+            gDebugIdMap.threadHandleToIndex[token] = info->unk1;
+            const auto threadTeb = gTtdCursor->GetTebAddress(info->threadid);
+            gProcessTebCache[token] = threadTeb;
+            gEventCallbacks->CreateThread((ULONG64)(uintptr_t)token, threadTeb, 0);
+        }
+        for (size_t i = 0; i < moduleCount; ++i)
+        {
+            if (i == mainModule || !modules[i].module)
+                continue;
+            const auto module = modules[i].module;
+            gEventCallbacks->LoadModule(0, module->base_addr, (ULONG)module->imageSize,
+                                        nullptr, module->path, module->checkSum, 0);
+        }
+        queueCallback([instruction]
+        {
+            EXCEPTION_DEBUG_INFO initialException = {};
+            initialException.ExceptionRecord.ExceptionCode = EXCEPTION_BREAKPOINT;
+            initialException.ExceptionRecord.ExceptionAddress = (PVOID)(ULONG_PTR)instruction;
+            setFakeDebugEvent(initialException);
+            dispatchSystemBreakpoint(&initialException);
+            return true;
+        });
+
+        const auto initProcess = createSyntheticTitanHandle(TitanHandleType::Process, processIndex, processSystemId, true);
+        const auto initThread = createSyntheticTitanHandle(TitanHandleType::Thread, threadIndex, threadSystemId, true);
+        gDebugIdMap.processHandleToIndex[initProcess] = processIndex;
+        gDebugIdMap.threadHandleToIndex[initThread] = threadIndex;
+        gProcessPebCache[initProcess] = peb;
+        gProcessTebCache[initThread] = teb;
+        gProcessInfo.hProcess = initProcess;
+        gProcessInfo.hThread = initThread;
+        return &gProcessInfo;
+    }
 
     auto hr = gDebugClient->OpenDumpFileWide(szArtifactPath, 0);
     if (FAILED(hr))
@@ -2861,13 +3191,23 @@ __declspec(dllexport) bool GetSessionInfo(TITAN_SESSION_INFO* SessionInfo)
         SessionInfo->capabilities = UE_SESSION_CAP_MEMORY_READ | UE_SESSION_CAP_MEMORY_QUERY |
                                     UE_SESSION_CAP_CONTEXT_READ;
     }
+    else if (SessionInfo->kind == UE_SESSION_TTD)
+    {
+        SessionInfo->capabilities = UE_SESSION_CAP_MEMORY_READ | UE_SESSION_CAP_MEMORY_QUERY |
+                                    UE_SESSION_CAP_CONTEXT_READ | UE_SESSION_CAP_FORWARD_EXECUTION |
+                                    UE_SESSION_CAP_REVERSE_EXECUTION | UE_SESSION_CAP_EXACT_POSITION |
+                                    UE_SESSION_CAP_LOGICAL_CODE_BREAKPOINT | UE_SESSION_CAP_LOGICAL_DATA_BREAKPOINT |
+                                    UE_SESSION_CAP_TIMELINE_STATE;
+    }
 
 #ifdef _WIN64
     SessionInfo->machineType = IMAGE_FILE_MACHINE_AMD64;
 #else
     SessionInfo->machineType = IMAGE_FILE_MACHINE_I386;
 #endif
-    if (gDebugControl)
+    if (SessionInfo->kind == UE_SESSION_TTD)
+        SessionInfo->machineType = gTtdMachineType;
+    else if (gDebugControl)
     {
         ULONG machineType = 0;
         if (SUCCEEDED(gDebugControl->GetEffectiveProcessorType(&machineType)))
@@ -2878,9 +3218,489 @@ __declspec(dllexport) bool GetSessionInfo(TITAN_SESSION_INFO* SessionInfo)
     return true;
 }
 
+static bool updateTtdCursorIdentity()
+{
+    if (!gTtdCursor)
+        return false;
+    const auto info = gTtdCursor->GetThreadInfo();
+    if (!info)
+        return false;
+    gTtdCurrentThreadId = info->threadid;
+    gFakeDebugEvent.dwProcessId = gTtdProcessId;
+    gFakeDebugEvent.dwThreadId = gTtdCurrentThreadId;
+    gTtdCursorChanged = true;
+    return true;
+}
+
+static void refreshTtdTimeline()
+{
+    if (!gTtdCursor)
+        return;
+
+    std::set<ULONG> activeThreadIndices;
+    const auto activeThreads = gTtdCursor->GetThreadList();
+    const auto activeThreadCount = gTtdCursor->GetThreadCount();
+    for (size_t i = 0; activeThreads && i < activeThreadCount; ++i)
+    {
+        const auto info = activeThreads[i].info;
+        if (!info)
+            continue;
+        activeThreadIndices.insert(info->unk1);
+        if (gDebugIdMap.threadIndexToHandle.contains(info->unk1))
+            continue;
+        const auto token = createSyntheticTitanHandle(TitanHandleType::Thread, info->unk1, info->threadid, false);
+        gDebugIdMap.threadIndexToHandle[info->unk1] = token;
+        gDebugIdMap.threadHandleToIndex[token] = info->unk1;
+        const auto teb = gTtdCursor->GetTebAddress(info->threadid);
+        gProcessTebCache[token] = teb;
+        gEventCallbacks->CreateThread((ULONG64)(uintptr_t)token, teb, 0);
+    }
+
+    std::vector<std::tuple<ULONG, HANDLE, DWORD>> terminatedThreads;
+    for (const auto& [index, handle] : gDebugIdMap.threadIndexToHandle)
+    {
+        if (activeThreadIndices.contains(index))
+            continue;
+        DWORD systemId = 0;
+        {
+            std::lock_guard lock(gMutexHandleRegistry);
+            const auto found = gHandleRegistry.find(handle);
+            if (found != gHandleRegistry.end())
+                systemId = found->second.systemId;
+        }
+        terminatedThreads.emplace_back(index, handle, systemId);
+    }
+    for (const auto& [index, handle, systemId] : terminatedThreads)
+    {
+        queueCallback([systemId]
+        {
+            EXIT_THREAD_DEBUG_INFO info = {};
+            setFakeDebugEvent(info);
+            gFakeDebugEvent.dwThreadId = systemId;
+            dispatchDebugEvent(UE_CH_EXITTHREAD, &info);
+            return true;
+        });
+        gDebugIdMap.threadIndexToHandle.erase(index);
+        gDebugIdMap.threadHandleToIndex.erase(handle);
+        gProcessTebCache.erase(handle);
+        unregisterTitanHandle(handle);
+    }
+
+    std::map<ULONG64, std::wstring> currentModules;
+    const auto modules = gTtdCursor->GetModuleList();
+    const auto moduleCount = gTtdCursor->GetModuleCount();
+    for (size_t i = 0; modules && i < moduleCount; ++i)
+    {
+        const auto module = modules[i].module;
+        if (!module || !module->path)
+            continue;
+        currentModules[module->base_addr] = std::wstring(module->path, module->path_len);
+        if (!gTtdActiveModules.contains(module->base_addr))
+            gEventCallbacks->LoadModule(0, module->base_addr, (ULONG)module->imageSize,
+                                        nullptr, module->path, module->checkSum, 0);
+    }
+    for (const auto& [base, path] : gTtdActiveModules)
+    {
+        if (!currentModules.contains(base))
+            gEventCallbacks->UnloadModule(path.c_str(), base);
+    }
+    gTtdActiveModules = std::move(currentModules);
+}
+
+static bool queueTtdWatchpointHit(const TtdWatchHit& hit)
+{
+    if (!hit.pending)
+        return false;
+
+    for (const auto& [id, breakpoint] : gBreakpoints)
+    {
+        if (breakpoint.kind != BreakpointKind::Software || breakpoint.offset != hit.address)
+            continue;
+        const auto callback = breakpoint.callback;
+        const auto oneShot = breakpoint.oneShot;
+        if (oneShot)
+        {
+            TTD::TTD_Replay_MemoryWatchpointData watchpoint { breakpoint.offset, 1, TTD::BP_FLAGS::EXEC };
+            gTtdCursor->RemoveMemoryWatchpoint(&watchpoint);
+            gBreakpoints.erase(id);
+        }
+        queueCallback([hit, callback]
+        {
+            EXCEPTION_DEBUG_INFO exception = {};
+            exception.dwFirstChance = TRUE;
+            exception.ExceptionRecord.ExceptionCode = EXCEPTION_BREAKPOINT;
+            exception.ExceptionRecord.ExceptionAddress = (PVOID)(ULONG_PTR)hit.address;
+            setFakeDebugEvent(exception);
+            gFakeDebugEvent.dwThreadId = hit.threadId;
+            beginDebugEvent(false);
+            if (callback)
+                callback();
+            finishDebugEvent(false);
+            return true;
+        });
+        return true;
+    }
+
+    for (const auto& [id, breakpoint] : gMemoryBreakpoints)
+    {
+        if (hit.address < breakpoint.start || hit.address - breakpoint.start >= breakpoint.size)
+            continue;
+        const auto accessMatches = breakpoint.type == UE_MEMORY ||
+                                   (breakpoint.type == UE_MEMORY_READ && hit.flags == MEM_READ_EVENT_FLAG) ||
+                                   (breakpoint.type == UE_MEMORY_WRITE && hit.flags == MEM_WRITE_EVENT_FLAG) ||
+                                   (breakpoint.type == UE_MEMORY_EXECUTE && hit.flags > MEM_WRITE_EVENT_FLAG);
+        if (!accessMatches)
+            continue;
+        const auto callback = breakpoint.callback;
+        if (!breakpoint.restoreOnHit)
+            removeMemoryBreakpointById(id);
+        queueCallback([hit, callback]
+        {
+            EXCEPTION_DEBUG_INFO exception = {};
+            exception.dwFirstChance = TRUE;
+            exception.ExceptionRecord.ExceptionCode = EXCEPTION_SINGLE_STEP;
+            exception.ExceptionRecord.ExceptionAddress = (PVOID)(ULONG_PTR)hit.address;
+            setFakeDebugEvent(exception);
+            gFakeDebugEvent.dwThreadId = hit.threadId;
+            beginDebugEvent(false);
+            if (callback)
+                callback((const void*)(ULONG_PTR)hit.address);
+            finishDebugEvent(false);
+            return true;
+        });
+        return true;
+    }
+    return false;
+}
+
+__declspec(dllexport) bool ReplayGetPosition(TITAN_REPLAY_POSITION* Position)
+{
+    if (Position)
+        *Position = {};
+    if (!Position)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    if (gSessionKind != UE_SESSION_TTD || !gTtdCursor)
+    {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
+    std::lock_guard lock(gMutexPaused);
+    const auto current = gTtdCursor->GetPosition();
+    if (!current)
+    {
+        SetLastError(ERROR_INVALID_DATA);
+        return false;
+    }
+    Position->sequence = current->Major;
+    Position->steps = current->Minor;
+    return true;
+}
+
+__declspec(dllexport) bool ReplayGetExtent(TITAN_REPLAY_POSITION* First, TITAN_REPLAY_POSITION* Last)
+{
+    if (First)
+        *First = {};
+    if (Last)
+        *Last = {};
+    if (!First || !Last)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    if (gSessionKind != UE_SESSION_TTD || !gTtdCursor)
+    {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
+    First->sequence = gTtdFirstPosition.Major;
+    First->steps = gTtdFirstPosition.Minor;
+    Last->sequence = gTtdLastPosition.Major;
+    Last->steps = gTtdLastPosition.Minor;
+    return true;
+}
+
+__declspec(dllexport) bool ReplaySetPosition(const TITAN_REPLAY_POSITION* Position)
+{
+    if (!Position)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    if (gSessionKind != UE_SESSION_TTD || !gTtdCursor)
+    {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
+    TTD::Position requested { Position->sequence, Position->steps };
+    if (requested < gTtdFirstPosition || requested > gTtdLastPosition || (gIsDebugging && !gPaused))
+    {
+        SetLastError(gIsDebugging && !gPaused ? ERROR_BUSY : ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    std::lock_guard lock(gMutexPaused);
+    gTtdCursor->SetPosition(const_cast<TTD::Position*>(&requested));
+    const auto actual = gTtdCursor->GetPosition();
+    if (!actual || actual->Major != requested.Major || actual->Minor != requested.Minor || !updateTtdCursorIdentity())
+    {
+        SetLastError(ERROR_INVALID_DATA);
+        return false;
+    }
+    refreshTtdTimeline();
+    return true;
+}
+
+__declspec(dllexport) bool ReplayRun(bool Reverse)
+{
+    if (gSessionKind != UE_SESSION_TTD || !gTtdCursor)
+    {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
+    if (gIsDebugging && !gPaused)
+    {
+        SetLastError(ERROR_BUSY);
+        return false;
+    }
+    gTtdNextRunReverse = Reverse;
+    return true;
+}
+
+__declspec(dllexport) bool ReplayStep(bool Reverse, bool StepOver, TITANCBSTEP StepCallBack)
+{
+    if (gSessionKind != UE_SESSION_TTD || !gTtdCursor)
+    {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
+    if (StepOver)
+    {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
+    if (gIsDebugging && !gPaused)
+    {
+        SetLastError(ERROR_BUSY);
+        return false;
+    }
+
+    TTD::TTD_Replay_ICursorView_ReplayResult result = {};
+    TtdWatchHit hit = {};
+    {
+        std::lock_guard lock(gMutexPaused);
+        gTtdWatchHit = {};
+        if (Reverse)
+            gTtdCursor->ReplayBackward(&result, &gTtdFirstPosition, 1);
+        else
+            gTtdCursor->ReplayForward(&result, &gTtdLastPosition, 1);
+        if (!result.stepCount || !updateTtdCursorIdentity())
+        {
+            SetLastError(ERROR_NO_MORE_ITEMS);
+            return false;
+        }
+        hit = gTtdWatchHit;
+        gTtdWatchHit = {};
+        refreshTtdTimeline();
+    }
+    const auto breakpointHit = queueTtdWatchpointHit(hit);
+    if (StepCallBack && !breakpointHit)
+    {
+        queueCallback([StepCallBack]
+        {
+            gFakeDebugEvent.dwProcessId = debugProcessId();
+            gFakeDebugEvent.dwThreadId = debugThreadId();
+            beginDebugEvent(false);
+            StepCallBack();
+            finishDebugEvent(false);
+            return true;
+        });
+    }
+    if (breakpointHit || StepCallBack)
+        gTtdMovementCondition.notify_all();
+    return true;
+}
+
+static bool runTtd(bool reverse)
+{
+    TTD::TTD_Replay_ICursorView_ReplayResult result = {};
+    TtdWatchHit hit = {};
+    TTD::TTD_Replay_ExceptionEvent exceptionEvent = {};
+    bool exceptionEventHit = false;
+    {
+        std::lock_guard lock(gMutexPaused);
+        gTtdWatchHit = {};
+        const auto before = gTtdCursor->GetPosition();
+        const TTD::Position beforePosition = before ? *before : TTD::Position {};
+        logDebug("TTD {} run from {:#x}:{:#x}", reverse ? "reverse" : "forward",
+                 beforePosition.Major, beforePosition.Minor);
+        TTD::Position movementLimit = reverse ? gTtdFirstPosition : gTtdLastPosition;
+        const auto exceptionEvents = gTtdEngine->GetExceptionEventList();
+        const auto exceptionCount = gTtdEngine->GetExceptionEventCount();
+        for (size_t i = 0; exceptionEvents && i < exceptionCount; ++i)
+        {
+            const auto& event = exceptionEvents[i];
+            const bool afterCurrent = event.pos.Major > beforePosition.Major ||
+                                      (event.pos.Major == beforePosition.Major && event.pos.Minor > beforePosition.Minor);
+            const bool beforeCurrent = event.pos.Major < beforePosition.Major ||
+                                       (event.pos.Major == beforePosition.Major && event.pos.Minor < beforePosition.Minor);
+            const bool betterForward = event.pos.Major < movementLimit.Major ||
+                                       (event.pos.Major == movementLimit.Major && event.pos.Minor < movementLimit.Minor);
+            const bool betterReverse = event.pos.Major > movementLimit.Major ||
+                                       (event.pos.Major == movementLimit.Major && event.pos.Minor > movementLimit.Minor);
+            if ((!reverse && afterCurrent && betterForward) || (reverse && beforeCurrent && betterReverse))
+            {
+                movementLimit = event.pos;
+                exceptionEvent = event;
+                exceptionEventHit = true;
+            }
+        }
+        gPaused = false;
+        for (unsigned attempt = 0; attempt < 2; ++attempt)
+        {
+            result = {};
+            gTtdWatchHit = {};
+            if (reverse)
+                gTtdCursor->ReplayBackward(&result, &movementLimit, UINT64_MAX);
+            else
+                gTtdCursor->ReplayForward(&result, &movementLimit, UINT64_MAX);
+            if (result.stepCount || !gTtdWatchHit.pending)
+                break;
+            if (gTtdWatchHit.sequence != beforePosition.Major || gTtdWatchHit.steps != beforePosition.Minor)
+            {
+                TTD::Position watchPosition { gTtdWatchHit.sequence, gTtdWatchHit.steps };
+                gTtdCursor->SetPositionOnThread(gTtdWatchHit.uniqueThreadId, &watchPosition);
+                const auto selectedThread = gTtdCursor->GetThreadInfo();
+                logDebug("Selected TTD watchpoint thread unique {} system {} (current unique {} system {}, pc {:#x})",
+                         gTtdWatchHit.uniqueThreadId, gTtdWatchHit.threadId,
+                         selectedThread ? selectedThread->unk1 : 0, selectedThread ? selectedThread->threadid : 0,
+                         gTtdCursor->GetProgramCounter());
+                result.stepCount = 1;
+                break;
+            }
+            logDebug("Ignoring a stale TTD watchpoint notification at the current position");
+        }
+        if (reverse && !result.stepCount && !gTtdWatchHit.pending)
+        {
+            logDebug("Falling back to bounded single-step reverse replay");
+            ULONG64 totalSteps = 0;
+            for (size_t i = 0; i < 1000000; ++i)
+            {
+                TTD::TTD_Replay_ICursorView_ReplayResult singleStep = {};
+                gTtdWatchHit = {};
+                gTtdCursor->ReplayBackward(&singleStep, &movementLimit, 1);
+                if (!singleStep.stepCount && !gTtdWatchHit.pending)
+                    break;
+                totalSteps += singleStep.stepCount;
+                if (gTtdWatchHit.pending)
+                    break;
+                const auto position = gTtdCursor->GetPosition();
+                if (!position || position->Major < movementLimit.Major ||
+                    (position->Major == movementLimit.Major && position->Minor <= movementLimit.Minor))
+                    break;
+            }
+            result.stepCount = totalSteps;
+        }
+        if (gTtdWatchHit.pending)
+        {
+            const auto position = gTtdCursor->GetPosition();
+            if (!position || position->Major != gTtdWatchHit.sequence || position->Minor != gTtdWatchHit.steps)
+            {
+                TTD::Position watchPosition { gTtdWatchHit.sequence, gTtdWatchHit.steps };
+                gTtdCursor->SetPositionOnThread(gTtdWatchHit.uniqueThreadId, &watchPosition);
+                if (!result.stepCount)
+                    result.stepCount = 1;
+            }
+        }
+        gPaused = true;
+        if (!updateTtdCursorIdentity())
+            return false;
+        hit = gTtdWatchHit;
+        gTtdWatchHit = {};
+        refreshTtdTimeline();
+        const auto after = gTtdCursor->GetPosition();
+        exceptionEventHit = exceptionEventHit && after && after->Major == exceptionEvent.pos.Major &&
+                            after->Minor == exceptionEvent.pos.Minor;
+        logDebug("TTD {} run stopped at {:#x}:{:#x} after {} steps (watch {:#x})",
+                 reverse ? "reverse" : "forward", after ? after->Major : 0, after ? after->Minor : 0,
+                 result.stepCount, hit.pending ? hit.address : 0);
+    }
+    if (queueTtdWatchpointHit(hit))
+    {
+        gTtdMovementCondition.notify_all();
+        return true;
+    }
+    if (exceptionEventHit)
+    {
+        EXCEPTION_RECORD64 exception = {};
+        exception.ExceptionCode = exceptionEvent.info.ExceptionCode;
+        exception.ExceptionFlags = exceptionEvent.info.ExceptionFlags;
+        exception.ExceptionRecord = exceptionEvent.info.ExceptionRecord;
+        exception.ExceptionAddress = exceptionEvent.info.ExceptionAddress;
+        exception.NumberParameters = (DWORD)(std::min<ULONG64>)(exceptionEvent.info.NumberParameters, EXCEPTION_MAXIMUM_PARAMETERS);
+        for (DWORD i = 0; i < exception.NumberParameters; ++i)
+            exception.ExceptionInformation[i] = exceptionEvent.info.ExceptionInformation[i];
+        gEventCallbacks->Exception(&exception, TRUE);
+        gTtdMovementCondition.notify_all();
+        return true;
+    }
+
+    queueCallback([reverse]
+    {
+        gNextExecutionStatus = DEBUG_STATUS_BREAK;
+        if (reverse)
+        {
+            EXCEPTION_DEBUG_INFO boundary = {};
+            boundary.dwFirstChance = TRUE;
+            boundary.ExceptionRecord.ExceptionCode = EXCEPTION_BREAKPOINT;
+            boundary.ExceptionRecord.ExceptionAddress = (PVOID)(ULONG_PTR)gTtdCursor->GetProgramCounter();
+            setFakeDebugEvent(boundary);
+            dispatchSystemBreakpoint(&boundary);
+        }
+        else
+        {
+            EXIT_PROCESS_DEBUG_INFO info = {};
+            setFakeDebugEvent(info);
+            dispatchDebugEvent(UE_CH_EXITPROCESS, &info);
+            {
+                std::lock_guard lock(gTtdMovementMutex);
+                gTtdStopRequested = true;
+            }
+        }
+        gTtdMovementCondition.notify_all();
+        return true;
+    });
+    gTtdMovementCondition.notify_all();
+    return result.stepCount != 0;
+}
+
 __declspec(dllexport) bool StopDebug()
 {
     const auto kind = gSessionKind.load();
+    if (kind == UE_SESSION_TTD)
+    {
+        {
+            std::lock_guard lock(gTtdMovementMutex);
+            gTtdStopRequested = true;
+        }
+        gTtdMovementCondition.notify_all();
+        if (!gIsDebugging)
+        {
+            gProcessInfo = {};
+            gProcessPebCache = {};
+            gProcessTebCache = {};
+            closeCallerOwnedTitanHandles();
+            gDebugIdMap = {};
+            {
+                std::lock_guard lock(gMutexCallbackQueue);
+                gCallbackQueue = {};
+            }
+            resetTtdSession();
+            gSessionKind = UE_SESSION_NONE;
+        }
+        return true;
+    }
     const auto endMode = kind == UE_SESSION_LIVE ? DEBUG_END_ACTIVE_TERMINATE : DEBUG_END_PASSIVE;
     auto hr = gDebugClient->EndSession(endMode);
     if (SUCCEEDED(hr) && !gIsDebugging && kind != UE_SESSION_LIVE)
@@ -2961,6 +3781,24 @@ __declspec(dllexport) bool SetBPX(ULONG_PTR bpxAddress, DWORD bpxType /* TitanSo
         }
     }
 
+    if (gSessionKind == UE_SESSION_TTD)
+    {
+        TTD::TTD_Replay_MemoryWatchpointData watchpoint { bpxAddress, 1, TTD::BP_FLAGS::EXEC };
+        if (!gTtdCursor || !gTtdCursor->AddMemoryWatchpoint(&watchpoint))
+        {
+            SetLastError(ERROR_GEN_FAILURE);
+            return false;
+        }
+        BreakpointInfo info;
+        info.id = gNextNativeBreakpointId++;
+        info.kind = BreakpointKind::Software;
+        info.callback = bpxCallBack;
+        info.offset = bpxAddress;
+        info.oneShot = (bpxType & UE_SINGLESHOOT) != 0;
+        gBreakpoints.emplace(info.id, info);
+        return true;
+    }
+
     TitanBreakpointType selectedType = gDefaultBreakpointType;
     switch (bpxType & 0xF0000000)
     {
@@ -3028,6 +3866,14 @@ __declspec(dllexport) bool DeleteBPX(ULONG_PTR bpxAddress)
     {
         if (info.kind == BreakpointKind::Software && info.offset == bpxAddress)
         {
+            if (gSessionKind == UE_SESSION_TTD)
+            {
+                TTD::TTD_Replay_MemoryWatchpointData watchpoint { bpxAddress, 1, TTD::BP_FLAGS::EXEC };
+                if (!gTtdCursor || !gTtdCursor->RemoveMemoryWatchpoint(&watchpoint))
+                    return false;
+                gBreakpoints.erase(id);
+                return true;
+            }
             if (info.nativePatch)
             {
                 if (!writeNativeBreakpointBytes(info, false))
@@ -3067,7 +3913,7 @@ __declspec(dllexport) bool SetMemoryBPXEx(ULONG_PTR MemoryStart, SIZE_T SizeOfMe
         SetLastError(gIsDebugging ? ERROR_BUSY : ERROR_INVALID_HANDLE);
         return false;
     }
-    auto process = activeProcessHandle();
+    auto process = gSessionKind == UE_SESSION_TTD ? sessionProcessHandle() : activeProcessHandle();
     if (!process)
     {
         SetLastError(ERROR_INVALID_HANDLE);
@@ -3090,6 +3936,21 @@ __declspec(dllexport) bool SetMemoryBPXEx(ULONG_PTR MemoryStart, SIZE_T SizeOfMe
     info.type = BreakPointType;
     info.restoreOnHit = RestoreOnHit;
     info.callback = bpxCallBack;
+    if (gSessionKind == UE_SESSION_TTD)
+    {
+        TTD::TTD_Replay_MemoryWatchpointData watchpoint {
+            MemoryStart,
+            SizeOfMemory,
+            ttdMemoryWatchFlags(BreakPointType),
+        };
+        if (!gTtdCursor || !gTtdCursor->AddMemoryWatchpoint(&watchpoint))
+        {
+            SetLastError(ERROR_GEN_FAILURE);
+            return false;
+        }
+        gMemoryBreakpoints.emplace(info.id, info);
+        return true;
+    }
     gMemoryBreakpoints.emplace(info.id, info);
 
     const auto startPage = pageAddress(MemoryStart);
@@ -3174,6 +4035,115 @@ __declspec(dllexport) bool RemoveMemoryBPX(ULONG_PTR MemoryStart, SIZE_T SizeOfM
     return false;
 }
 
+static bool readTtdContext(HANDLE threadHandle, TITAN_ENGINE_CONTEXT_t* titan)
+{
+    if (!gTtdCursor || !titan)
+        return false;
+    DWORD threadId = 0;
+    {
+        std::lock_guard lock(gMutexHandleRegistry);
+        const auto found = gHandleRegistry.find(threadHandle);
+        if (found == gHandleRegistry.end() || found->second.type != TitanHandleType::Thread ||
+            found->second.sessionGeneration != gSessionGeneration)
+        {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return false;
+        }
+        threadId = found->second.systemId;
+    }
+
+    auto contextBuffer = gTtdCursor->AllocateContextBuffer();
+    const auto context = gTtdCursor->GetCrossPlatformContext(threadId, contextBuffer);
+    if (!context)
+    {
+        gTtdCursor->FreeContextBuffer(contextBuffer);
+        SetLastError(ERROR_INVALID_DATA);
+        return false;
+    }
+#ifdef _WIN64
+    const auto native = static_cast<const CONTEXT*>(context);
+    titan->cax = native->Rax;
+    titan->cbx = native->Rbx;
+    titan->ccx = native->Rcx;
+    titan->cdx = native->Rdx;
+    titan->csi = native->Rsi;
+    titan->cdi = native->Rdi;
+    titan->cbp = native->Rbp;
+    titan->csp = native->Rsp;
+    titan->cip = native->Rip;
+    titan->eflags = native->EFlags;
+    titan->r8 = native->R8;
+    titan->r9 = native->R9;
+    titan->r10 = native->R10;
+    titan->r11 = native->R11;
+    titan->r12 = native->R12;
+    titan->r13 = native->R13;
+    titan->r14 = native->R14;
+    titan->r15 = native->R15;
+    titan->cs = native->SegCs;
+    titan->ss = native->SegSs;
+    titan->ds = native->SegDs;
+    titan->es = native->SegEs;
+    titan->fs = native->SegFs;
+    titan->gs = native->SegGs;
+    titan->dr0 = native->Dr0;
+    titan->dr1 = native->Dr1;
+    titan->dr2 = native->Dr2;
+    titan->dr3 = native->Dr3;
+    titan->dr6 = native->Dr6;
+    titan->dr7 = native->Dr7;
+    titan->MxCsr = native->MxCsr;
+    titan->x87fpu.ControlWord = native->FltSave.ControlWord;
+    titan->x87fpu.StatusWord = native->FltSave.StatusWord;
+    titan->x87fpu.TagWord = native->FltSave.TagWord;
+    for (size_t i = 0; i < 8; ++i)
+        memcpy(titan->RegisterArea + i * 10, &native->FltSave.FloatRegisters[i], 10);
+    for (size_t i = 0; i < std::size(titan->XmmRegisters); ++i)
+    {
+        memcpy(&titan->XmmRegisters[i], &native->FltSave.XmmRegisters[i], sizeof(XmmRegister_t));
+        titan->YmmRegisters[i].Low = titan->XmmRegisters[i];
+    }
+#else
+    const auto native = static_cast<const WOW64_CONTEXT*>(context);
+    titan->cax = native->Eax;
+    titan->cbx = native->Ebx;
+    titan->ccx = native->Ecx;
+    titan->cdx = native->Edx;
+    titan->csi = native->Esi;
+    titan->cdi = native->Edi;
+    titan->cbp = native->Ebp;
+    titan->csp = native->Esp;
+    titan->cip = native->Eip;
+    titan->eflags = native->EFlags;
+    titan->cs = native->SegCs;
+    titan->ss = native->SegSs;
+    titan->ds = native->SegDs;
+    titan->es = native->SegEs;
+    titan->fs = native->SegFs;
+    titan->gs = native->SegGs;
+    titan->dr0 = native->Dr0;
+    titan->dr1 = native->Dr1;
+    titan->dr2 = native->Dr2;
+    titan->dr3 = native->Dr3;
+    titan->dr6 = native->Dr6;
+    titan->dr7 = native->Dr7;
+    const auto save = reinterpret_cast<const XSAVE_FORMAT*>(native->ExtendedRegisters);
+    titan->MxCsr = save->MxCsr;
+    titan->x87fpu.ControlWord = save->ControlWord;
+    titan->x87fpu.StatusWord = save->StatusWord;
+    titan->x87fpu.TagWord = save->TagWord;
+    for (size_t i = 0; i < 8; ++i)
+        memcpy(titan->RegisterArea + i * 10, &save->FloatRegisters[i], 10);
+    for (size_t i = 0; i < std::size(titan->XmmRegisters); ++i)
+    {
+        memcpy(&titan->XmmRegisters[i], &save->XmmRegisters[i], sizeof(XmmRegister_t));
+        titan->YmmRegisters[i].Low = titan->XmmRegisters[i];
+    }
+#endif
+    gTtdCursor->FreeContextBuffer(contextBuffer);
+    return true;
+}
+
 static void readReplayExtendedContext(TITAN_ENGINE_CONTEXT_t* titcontext)
 {
     titcontext->x87fpu.ControlWord = (WORD)gRegisterCache.GetValue(UE_X87_CONTROLWORD);
@@ -3224,6 +4194,9 @@ __declspec(dllexport) bool GetFullContextDataEx(HANDLE hActiveThread, TITAN_ENGI
     {
         return false;
     }
+
+    if (gSessionKind == UE_SESSION_TTD)
+        return readTtdContext(hActiveThread, titcontext);
 
     DebugThreadScope threadScope(hActiveThread);
     if (!threadScope)
@@ -3405,6 +4378,68 @@ __declspec(dllexport) ULONG_PTR GetContextDataEx(HANDLE hActiveThread, TitanRegi
         }
     }
 
+    if (gSessionKind == UE_SESSION_TTD)
+    {
+        TITAN_ENGINE_CONTEXT_t context = {};
+        if (!readTtdContext(hActiveThread, &context))
+            return 0;
+        switch (IndexOfRegister)
+        {
+#ifdef _WIN64
+        case UE_RAX: return context.cax;
+        case UE_RBX: return context.cbx;
+        case UE_RCX: return context.ccx;
+        case UE_RDX: return context.cdx;
+        case UE_RSI: return context.csi;
+        case UE_RDI: return context.cdi;
+        case UE_RBP: return context.cbp;
+        case UE_RSP:
+        case UE_CSP: return context.csp;
+        case UE_RIP:
+        case UE_CIP: return context.cip;
+        case UE_RFLAGS: return context.eflags;
+        case UE_R8: return context.r8;
+        case UE_R9: return context.r9;
+        case UE_R10: return context.r10;
+        case UE_R11: return context.r11;
+        case UE_R12: return context.r12;
+        case UE_R13: return context.r13;
+        case UE_R14: return context.r14;
+        case UE_R15: return context.r15;
+#else
+        case UE_EAX: return context.cax;
+        case UE_EBX: return context.cbx;
+        case UE_ECX: return context.ccx;
+        case UE_EDX: return context.cdx;
+        case UE_ESI: return context.csi;
+        case UE_EDI: return context.cdi;
+        case UE_EBP: return context.cbp;
+        case UE_ESP:
+        case UE_CSP: return context.csp;
+        case UE_EIP:
+        case UE_CIP: return context.cip;
+        case UE_EFLAGS: return context.eflags;
+#endif
+        case UE_SEG_CS: return context.cs;
+        case UE_SEG_SS: return context.ss;
+        case UE_SEG_DS: return context.ds;
+        case UE_SEG_ES: return context.es;
+        case UE_SEG_FS: return context.fs;
+        case UE_SEG_GS: return context.gs;
+        case UE_DR0: return context.dr0;
+        case UE_DR1: return context.dr1;
+        case UE_DR2: return context.dr2;
+        case UE_DR3: return context.dr3;
+        case UE_DR6: return context.dr6;
+        case UE_DR7: return context.dr7;
+        case UE_MXCSR: return context.MxCsr;
+        case UE_X87_CONTROLWORD: return context.x87fpu.ControlWord;
+        case UE_X87_STATUSWORD: return context.x87fpu.StatusWord;
+        case UE_X87_TAGWORD: return context.x87fpu.TagWord;
+        default: return 0;
+        }
+    }
+
     DebugThreadScope threadScope(hActiveThread);
     if (!threadScope)
         return 0;
@@ -3451,6 +4486,11 @@ __declspec(dllexport) bool GetAVX512Context(HANDLE hActiveThread, TITAN_ENGINE_C
         return false;
     for (size_t i = 0; i < std::size(avx.YmmRegisters); ++i)
         titcontext->ZmmRegisters[i].Low = avx.YmmRegisters[i];
+    if (gSessionKind == UE_SESSION_TTD)
+    {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
 
     PauseLock pl;
     if (!pl)
@@ -3637,11 +4677,21 @@ static void debugStep(ULONG status, TITANCBSTEP callback)
 
 __declspec(dllexport) void StepInto(TITANCBSTEP traceCallBack)
 {
+    if (gSessionKind == UE_SESSION_TTD)
+    {
+        ReplayStep(false, false, traceCallBack);
+        return;
+    }
     debugStep(DEBUG_STATUS_STEP_INTO, traceCallBack);
 }
 
 __declspec(dllexport) void StepOver(TITANCBSTEP traceCallBack)
 {
+    if (gSessionKind == UE_SESSION_TTD)
+    {
+        ReplayStep(false, true, traceCallBack);
+        return;
+    }
     debugStep(DEBUG_STATUS_STEP_OVER, traceCallBack);
 }
 
@@ -3927,6 +4977,78 @@ __declspec(dllexport) void DebugLoop()
     }
     logDebug("[{}] dwThreadId: {:#x}", __func__, GetCurrentThreadId());
 
+    if (gSessionKind == UE_SESSION_TTD)
+    {
+        gIsDebugging = true;
+        gPaused = true;
+        while (true)
+        {
+            while (true)
+            {
+                std::function<bool()> work;
+                {
+                    std::lock_guard lock(gMutexCallbackQueue);
+                    if (gCallbackQueue.empty())
+                        break;
+                    work = std::move(gCallbackQueue.front());
+                    gCallbackQueue.pop();
+                }
+                if (!work())
+                    logError("TTD worker callback failed");
+            }
+
+            {
+                std::lock_guard movementLock(gTtdMovementMutex);
+                if (gTtdStopRequested)
+                    break;
+            }
+            const auto executionStatus = gNextExecutionStatus;
+            gNextExecutionStatus = DEBUG_STATUS_NO_CHANGE;
+            if (executionStatus == DEBUG_STATUS_GO || executionStatus == DEBUG_STATUS_GO_HANDLED ||
+                executionStatus == DEBUG_STATUS_GO_NOT_HANDLED)
+            {
+                const auto reverse = std::exchange(gTtdNextRunReverse, false);
+                if (!runTtd(reverse))
+                    logError("TTD {} run did not move the cursor", reverse ? "reverse" : "forward");
+                continue;
+            }
+
+            std::unique_lock movementLock(gTtdMovementMutex);
+            if (gTtdStopRequested)
+                break;
+            gTtdMovementCondition.wait_for(movementLock, std::chrono::milliseconds(100));
+            if (gTtdStopRequested)
+                break;
+        }
+        gPaused = false;
+        gIsDebugging = false;
+        gProcessInfo = {};
+        gCustomHandlers = {};
+        gFakeDebugEvent = {};
+        {
+            std::lock_guard lock(gMutexCallbackQueue);
+            gCallbackQueue = {};
+        }
+        gProcessPebCache = {};
+        gProcessTebCache = {};
+        closeCallerOwnedTitanHandles();
+        gDebugIdMap = {};
+        gBreakpoints = {};
+        gHardwareBreakpointIds = {};
+        gMemoryBreakpoints = {};
+        gMemoryBreakpointPages = {};
+        gStepCallbacks = {};
+        gStepThreadSystemIds = {};
+        gInternalStepCallbacks = {};
+        gInternalStepSuspendedThreads = {};
+        gStepStatuses = {};
+        gRetiredBreakpointAddresses = {};
+        gAttachCallback = nullptr;
+        resetTtdSession();
+        gSessionKind = UE_SESSION_NONE;
+        return;
+    }
+
     gIsDebugging = true;
     while (true)
     {
@@ -4187,7 +5309,20 @@ __declspec(dllexport) bool IsFileBeingDebugged()
 // TitanEngine.Process.functions:
 __declspec(dllexport) HANDLE TitanOpenProcess(DWORD dwDesiredAccess, bool bInheritHandle, DWORD dwProcessId)
 {
-    if (gSessionKind == UE_SESSION_MINIDUMP || gSessionKind == UE_SESSION_TTD)
+    if (gSessionKind == UE_SESSION_TTD)
+    {
+        if (dwProcessId != gTtdProcessId)
+        {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+        constexpr ULONG processIndex = 0;
+        const auto handle = createSyntheticTitanHandle(TitanHandleType::Process, processIndex, dwProcessId, true);
+        gDebugIdMap.processHandleToIndex[handle] = processIndex;
+        gProcessPebCache[handle] = gTtdEngine ? gTtdEngine->GetPebAddress() : 0;
+        return handle;
+    }
+    if (gSessionKind == UE_SESSION_MINIDUMP)
     {
         ULONG processIndex = DEBUG_ANY_ID;
         if (dwProcessId != debugProcessId() || FAILED(gDebugSystemObjects->GetCurrentProcessId(&processIndex)))
@@ -4209,7 +5344,25 @@ __declspec(dllexport) HANDLE TitanOpenProcess(DWORD dwDesiredAccess, bool bInher
 
 __declspec(dllexport) HANDLE TitanOpenThread(DWORD dwDesiredAccess, bool bInheritHandle, DWORD dwThreadId)
 {
-    if (gSessionKind == UE_SESSION_MINIDUMP || gSessionKind == UE_SESSION_TTD)
+    if (gSessionKind == UE_SESSION_TTD)
+    {
+        if (!gTtdEngine || !gTtdCursor)
+            return nullptr;
+        const auto count = gTtdEngine->GetThreadCount();
+        const auto threads = gTtdEngine->GetThreadList();
+        for (size_t i = 0; threads && i < count; ++i)
+        {
+            if (threads[i].threadid != dwThreadId)
+                continue;
+            const auto handle = createSyntheticTitanHandle(TitanHandleType::Thread, threads[i].unk1, dwThreadId, true);
+            gDebugIdMap.threadHandleToIndex[handle] = threads[i].unk1;
+            gProcessTebCache[handle] = gTtdCursor->GetTebAddress(dwThreadId);
+            return handle;
+        }
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    if (gSessionKind == UE_SESSION_MINIDUMP)
     {
         ULONG count = 0;
         if (FAILED(gDebugSystemObjects->GetNumberThreads(&count)) || !count)
@@ -4250,6 +5403,17 @@ __declspec(dllexport) bool TitanGetProcessImagePathW(HANDLE hProcess, LPWSTR szP
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
+    if (gSessionKind == UE_SESSION_TTD)
+    {
+        if (gTtdImagePath.empty() || gTtdImagePath.size() + 1 > cchPath)
+        {
+            *szPath = L'\0';
+            SetLastError(gTtdImagePath.empty() ? ERROR_NOT_FOUND : ERROR_INSUFFICIENT_BUFFER);
+            return false;
+        }
+        memcpy(szPath, gTtdImagePath.c_str(), (gTtdImagePath.size() + 1) * sizeof(wchar_t));
+        return true;
+    }
     ULONG64 base = 0;
     auto hr = gDebugSymbols->GetModuleByIndex(0, &base);
     if (SUCCEEDED(hr))
@@ -4270,6 +5434,29 @@ __declspec(dllexport) bool TitanGetModulePathW(HANDLE hProcess, ULONG_PTR Module
         !gDebugIdMap.processHandleToIndex.contains(hProcess))
     {
         SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    if (gSessionKind == UE_SESSION_TTD)
+    {
+        const auto modules = gTtdCursor ? gTtdCursor->GetModuleList() : nullptr;
+        const auto count = gTtdCursor ? gTtdCursor->GetModuleCount() : 0;
+        for (size_t i = 0; modules && i < count; ++i)
+        {
+            const auto module = modules[i].module;
+            if (!module || module->base_addr != (ULONG64)ModuleBase || !module->path)
+                continue;
+            std::wstring path(module->path, module->path_len);
+            if (path.size() + 1 > cchPath)
+            {
+                *szPath = L'\0';
+                SetLastError(ERROR_INSUFFICIENT_BUFFER);
+                return false;
+            }
+            memcpy(szPath, path.c_str(), (path.size() + 1) * sizeof(wchar_t));
+            return true;
+        }
+        *szPath = L'\0';
+        SetLastError(ERROR_NOT_FOUND);
         return false;
     }
     ULONG index = DEBUG_ANY_ID;
@@ -4316,6 +5503,16 @@ __declspec(dllexport) bool ProcessIsWow64(HANDLE hProcess, PBOOL isWow64)
     {
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
+    }
+    if (gSessionKind == UE_SESSION_TTD)
+    {
+        if (!gDebugIdMap.processHandleToIndex.contains(hProcess))
+        {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return false;
+        }
+        *isWow64 = gTtdMachineType == IMAGE_FILE_MACHINE_I386;
+        return true;
     }
     const auto nativeHandle = registeredNativeHandle(hProcess, TitanHandleType::Process);
     return nativeHandle && !!IsWow64Process(nativeHandle, isWow64);

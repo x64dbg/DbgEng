@@ -11,7 +11,10 @@ x64 AVX/AVX-512 contexts, non-current thread selection, repeatable sessions,
 and common process/thread controls. It also supports immutable x64/x86
 user-minidump sessions with synthetic process/thread identities, captured
 memory maps, contexts, modules, threads, stored exceptions, and repeatable
-teardown. Event, initialization, and explicitly opened process/thread handles
+teardown. TTD `.run` sessions additionally support exact positions, forward
+and reverse execution, trace exceptions, timeline changes, and logical
+code/data breakpoints through the typed TTD replay engine. Event,
+initialization, and explicitly opened process/thread handles
 are tracked in an authoritative ownership registry. Page-guard rearming
 suspends peer target threads during the hidden
 single instruction so concurrent accesses cannot escape while the guard is
@@ -54,11 +57,12 @@ Two replay probes are built alongside the other targets:
 ```bash
 build\Release\replay_probe.exe artifact.dmp
 build\Release\shim_replay_probe.exe artifact.dmp
+build\Release\shim_replay_probe.exe artifact.run
 ```
 
 The first inventories the raw DbgEng dump session. The second validates the
-TitanEngine-compatible minidump boundary. TTD probing additionally requires a
-valid `.run` trace and its replay runtime components.
+TitanEngine-compatible minidump or TTD boundary, including exact seek and
+forward/reverse movement for traces.
 
 ## Usage
 

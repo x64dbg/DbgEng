@@ -15,6 +15,7 @@ HANDLE gContinueEvent = nullptr;
 HANDLE gProcess = nullptr;
 HANDLE gThread = nullptr;
 ULONG_PTR gImageBase = 0;
+TitanSessionKind gExpectedKind = UE_SESSION_MINIDUMP;
 std::atomic<unsigned> gThreadCount = 0;
 std::atomic<unsigned> gModuleCount = 0;
 
@@ -47,6 +48,10 @@ struct Api
     decltype(&EngineCheckStructAlignment) EngineCheckStructAlignment = nullptr;
     decltype(&InitReplayW) InitReplayW = nullptr;
     decltype(&GetSessionInfo) GetSessionInfo = nullptr;
+    decltype(&ReplayGetPosition) ReplayGetPosition = nullptr;
+    decltype(&ReplayGetExtent) ReplayGetExtent = nullptr;
+    decltype(&ReplaySetPosition) ReplaySetPosition = nullptr;
+    decltype(&ReplayStep) ReplayStep = nullptr;
     decltype(&SetCustomHandler) SetCustomHandler = nullptr;
     decltype(&TitanCloseHandle) TitanCloseHandle = nullptr;
     decltype(&DebugLoop) DebugLoop = nullptr;
@@ -69,7 +74,7 @@ DWORD WINAPI worker(void* artifact)
     gApi.SetCustomHandler(UE_CH_LOADDLL, onLoadModule);
     gApi.SetCustomHandler(UE_CH_SYSTEMBREAKPOINT, onSystemBreakpoint);
 
-    auto* info = gApi.InitReplayW(static_cast<const wchar_t*>(artifact), UE_SESSION_MINIDUMP);
+    auto* info = gApi.InitReplayW(static_cast<const wchar_t*>(artifact), gExpectedKind);
     if(!info)
     {
         gWorkerError = GetLastError();
@@ -98,9 +103,12 @@ int wmain(int argc, wchar_t** argv)
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if(argc != 2)
     {
-        std::fwprintf(stderr, L"usage: shim_replay_probe <minidump>\n");
+        std::fwprintf(stderr, L"usage: shim_replay_probe <minidump-or-trace>\n");
         return 2;
     }
+    const std::wstring artifact = argv[1];
+    if(artifact.size() >= 4 && _wcsicmp(artifact.c_str() + artifact.size() - 4, L".run") == 0)
+        gExpectedKind = UE_SESSION_TTD;
 
     const auto module = LoadLibraryW(L"TitanEngine.dll");
     if(!module)
@@ -113,6 +121,10 @@ int wmain(int argc, wchar_t** argv)
     RESOLVE(EngineCheckStructAlignment);
     RESOLVE(InitReplayW);
     RESOLVE(GetSessionInfo);
+    RESOLVE(ReplayGetPosition);
+    RESOLVE(ReplayGetExtent);
+    RESOLVE(ReplaySetPosition);
+    RESOLVE(ReplayStep);
     RESOLVE(SetCustomHandler);
     RESOLVE(TitanCloseHandle);
     RESOLVE(DebugLoop);
@@ -164,6 +176,30 @@ int wmain(int argc, wchar_t** argv)
                 session.machineType, session.processId, session.threadId);
     std::printf("events image=%p threads=%u modules=%u\n", reinterpret_cast<void*>(gImageBase),
                 gThreadCount.load(), gModuleCount.load());
+
+    if(gExpectedKind == UE_SESSION_TTD)
+    {
+        TITAN_REPLAY_POSITION first = {}, last = {}, current = {};
+        if(!gApi.ReplayGetExtent(&first, &last) || !gApi.ReplayGetPosition(&current))
+        {
+            std::printf("TTD position query failed: %lu\n", GetLastError());
+            return 1;
+        }
+        std::printf("timeline first=%llx:%llx current=%llx:%llx last=%llx:%llx\n",
+                    first.sequence, first.steps, current.sequence, current.steps, last.sequence, last.steps);
+        if(!gApi.ReplayStep(false, false, nullptr) || !gApi.ReplayStep(true, false, nullptr))
+        {
+            std::printf("TTD forward/reverse step failed: %lu\n", GetLastError());
+            return 1;
+        }
+        if(!gApi.ReplaySetPosition(&last) || !gApi.ReplayGetPosition(&current) ||
+           current.sequence != last.sequence || current.steps != last.steps ||
+           !gApi.ReplaySetPosition(&first))
+        {
+            std::printf("TTD exact seek round trip failed: %lu\n", GetLastError());
+            return 1;
+        }
+    }
 
     TITAN_ENGINE_CONTEXT_t context = {};
     if(!gApi.GetFullContextDataEx(gThread, &context))
@@ -224,7 +260,7 @@ int wmain(int argc, wchar_t** argv)
         std::printf("DebugLoop teardown failed: wait=%lu exit=%lu\n", wait, workerExit);
         return 1;
     }
-    std::puts("PASS shim minidump replay probe");
+    std::printf("PASS shim %s replay probe\n", gExpectedKind == UE_SESSION_TTD ? "TTD" : "minidump");
     // The adapter intentionally remains loaded for x64dbg's process lifetime.
     // Avoid turning this probe into a test of explicit DLL unload under the
     // Windows loader lock.
