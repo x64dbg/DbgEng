@@ -8,9 +8,12 @@ The shim supports live x64 and x86 launch and attach sessions, x64dbg event
 translation, short/long-INT3 and UD2 software breakpoints, DbgEng data/hardware
 breakpoints, page-guard memory breakpoints, stepping, filtered/raw memory-read operations, full
 x64 AVX/AVX-512 contexts, non-current thread selection, repeatable sessions,
-and common process/thread controls. Event, initialization, and explicitly
-opened process/thread handles are tracked in an authoritative ownership
-registry. Page-guard rearming suspends peer target threads during the hidden
+and common process/thread controls. It also supports immutable x64/x86
+user-minidump sessions with synthetic process/thread identities, captured
+memory maps, contexts, modules, threads, stored exceptions, and repeatable
+teardown. Event, initialization, and explicitly opened process/thread handles
+are tracked in an authoritative ownership registry. Page-guard rearming
+suspends peer target threads during the hidden
 single instruction so concurrent accesses cannot escape while the guard is
 temporarily clear.
 
@@ -45,6 +48,17 @@ When the shim is loaded by x64dbg, x64dbg's root `dbghelp.dll` must match this
 DbgEng distribution. Windows binds DbgEng to an already-loaded `dbghelp.dll`;
 an older x64dbg copy causes `LoadLibrary(dbgeng.dll)` to fail with
 `ERROR_PROC_NOT_FOUND`.
+
+Two replay probes are built alongside the other targets:
+
+```bash
+build\Release\replay_probe.exe artifact.dmp
+build\Release\shim_replay_probe.exe artifact.dmp
+```
+
+The first inventories the raw DbgEng dump session. The second validates the
+TitanEngine-compatible minidump boundary. TTD probing additionally requires a
+valid `.run` trace and its replay runtime components.
 
 ## Usage
 

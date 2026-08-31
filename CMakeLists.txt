@@ -64,6 +64,57 @@ if(NOT CMKR_VS_STARTUP_PROJECT)
 	set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT playground)
 endif()
 
+# Target: replay_probe
+set(replay_probe_SOURCES
+	cmake.toml
+	"src/replay_probe/replay_probe.cpp"
+)
+
+add_executable(replay_probe)
+
+target_sources(replay_probe PRIVATE ${replay_probe_SOURCES})
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${replay_probe_SOURCES})
+
+target_compile_features(replay_probe PRIVATE
+	cxx_std_20
+)
+
+target_link_libraries(replay_probe PRIVATE
+	DbgEng
+	Delayimp
+)
+
+if(MSVC) # msvc
+	target_link_options(replay_probe PRIVATE
+		"/DELAYLOAD:dbgeng.dll"
+	)
+endif()
+
+get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+if(NOT CMKR_VS_STARTUP_PROJECT)
+	set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT replay_probe)
+endif()
+
+# Target: shim_replay_probe
+set(shim_replay_probe_SOURCES
+	cmake.toml
+	"src/shim_replay_probe/shim_replay_probe.cpp"
+)
+
+add_executable(shim_replay_probe)
+
+target_sources(shim_replay_probe PRIVATE ${shim_replay_probe_SOURCES})
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${shim_replay_probe_SOURCES})
+
+target_compile_features(shim_replay_probe PRIVATE
+	cxx_std_20
+)
+
+get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+if(NOT CMKR_VS_STARTUP_PROJECT)
+	set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT shim_replay_probe)
+endif()
+
 # Target: TitanEngine
 set(TitanEngine_SOURCES
 	cmake.toml

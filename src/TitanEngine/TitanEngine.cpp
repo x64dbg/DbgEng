@@ -207,6 +207,7 @@ struct TitanHandleEntry
     DWORD systemId = 0;
     HANDLE nativeHandle = nullptr;
     bool callerOwned = false;
+    uint64_t sessionGeneration = 0;
 };
 
 enum class BreakpointKind
@@ -260,6 +261,8 @@ static std::map<HANDLE, uint64_t> gProcessTebCache;
 static DebugIdMap gDebugIdMap;
 static std::recursive_mutex gMutexHandleRegistry;
 static std::map<HANDLE, TitanHandleEntry> gHandleRegistry;
+static uint64_t gSessionGeneration = 0;
+static uintptr_t gNextSyntheticHandle = 1;
 static std::map<ULONG, BreakpointInfo> gBreakpoints;
 static std::map<DWORD, ULONG> gHardwareBreakpointIds;
 static std::map<uint64_t, MemoryBreakpointInfo> gMemoryBreakpoints;
@@ -270,6 +273,7 @@ static std::set<ULONG64> gRetiredBreakpointAddresses;
 static std::recursive_mutex gMutexPaused;
 static std::atomic_bool gPaused; // this is set to true when we are not inside WaitForEvent (perhaps it should be renamed?)
 static std::atomic_bool gIsDebugging;
+static std::atomic<TitanSessionKind> gSessionKind = UE_SESSION_NONE;
 static bool gDbgEngInitialized = false;
 static bool gComInitialized = false;
 static HANDLE gProcessCreatedEvent = nullptr;
@@ -386,7 +390,9 @@ static void finishDebugEvent(bool unhandledException)
 {
     if (gNextExecutionStatus == DEBUG_STATUS_NO_CHANGE)
     {
-        if (!gStepStatuses.empty())
+        if (gSessionKind == UE_SESSION_MINIDUMP)
+            gNextExecutionStatus = DEBUG_STATUS_BREAK;
+        else if (!gStepStatuses.empty())
             gNextExecutionStatus = gStepStatuses.begin()->second;
         else
             gNextExecutionStatus = unhandledException && gNextContinueStatus == DBG_EXCEPTION_NOT_HANDLED
@@ -513,12 +519,30 @@ static void setFakeDebugEvent(const OUTPUT_DEBUG_STRING_INFO& info)
     gFakeDebugEvent.u.DebugString = info;
 }
 
-static void registerTitanHandle(HANDLE handle, TitanHandleType type, ULONG dbgengId, DWORD systemId, bool callerOwned)
+static void registerTitanHandle(HANDLE handle, TitanHandleType type, ULONG dbgengId, DWORD systemId, bool callerOwned, HANDLE nativeHandle)
 {
     if (!handle || handle == INVALID_HANDLE_VALUE)
         return;
     std::lock_guard lock(gMutexHandleRegistry);
-    gHandleRegistry.insert_or_assign(handle, TitanHandleEntry { type, dbgengId, systemId, handle, callerOwned });
+    gHandleRegistry.insert_or_assign(handle, TitanHandleEntry { type, dbgengId, systemId, nativeHandle, callerOwned, gSessionGeneration });
+}
+
+static void registerTitanHandle(HANDLE handle, TitanHandleType type, ULONG dbgengId, DWORD systemId, bool callerOwned)
+{
+    registerTitanHandle(handle, type, dbgengId, systemId, callerOwned, handle);
+}
+
+static HANDLE createSyntheticTitanHandle(TitanHandleType type, ULONG dbgengId, DWORD systemId, bool callerOwned)
+{
+    const auto serial = gNextSyntheticHandle++;
+#ifdef _WIN64
+    const auto value = 0xFFFF800000000000ull | ((serial & 0x00007FFFFFFFFFFFull) << 4) | 3;
+#else
+    const auto value = 0xF0000000u | ((serial & 0x00FFFFFFu) << 4) | 3;
+#endif
+    const auto handle = (HANDLE)(uintptr_t)value;
+    registerTitanHandle(handle, type, dbgengId, systemId, callerOwned, nullptr);
+    return handle;
 }
 
 static void unregisterTitanHandle(HANDLE handle)
@@ -654,6 +678,18 @@ static void scheduleInternalStep(std::function<void()> callback)
         return;
     }
 
+    auto existingInternalStep = gInternalStepCallbacks.find(threadIndex);
+    if (existingInternalStep != gInternalStepCallbacks.end())
+    {
+        auto previous = std::move(existingInternalStep->second);
+        existingInternalStep->second = [previous = std::move(previous), callback = std::move(callback)]
+        {
+            previous();
+            callback();
+        };
+        return;
+    }
+
     TITANCBSTEP userStep = nullptr;
     auto existingUserStep = gStepCallbacks.find(threadIndex);
     if (existingUserStep != gStepCallbacks.end())
@@ -778,7 +814,13 @@ static bool dispatchMemoryBreakpointException(const EXCEPTION_DEBUG_INFO& info)
     // any breakpoint on this page, execute the faulting instruction once and
     // restore the guard before normal execution or a user step continues.
     if (gMemoryBreakpointPages.contains(page))
+    {
+        // Explicitly expose the faulting page. Windows normally clears
+        // PAGE_GUARD before delivery, but doing this here makes cross-page
+        // instructions deterministic across DbgEng/runtime versions.
+        protectMemoryBreakpointPage(page, false);
         scheduleMemoryBreakpointRearm(page);
+    }
     finishDebugEvent(false);
     return true;
 }
@@ -1094,6 +1136,7 @@ public:
             // NOTE: Used by GetTEBLocation
             gProcessTebCache[info.hThread] = DataOffset;
             HRESULT hr = {};
+            if (gSessionKind == UE_SESSION_LIVE)
             {
                 ULONG threadIndex = 0;
                 hr = gDebugSystemObjects->GetCurrentThreadId(&threadIndex);
@@ -1109,12 +1152,16 @@ public:
                 ULONG handleIndex = 0;
                 hr = gDebugSystemObjects->GetThreadIdByHandle(Handle, &handleIndex);
                 if (FAILED(hr))
-                {
                     logError("Failed to get event thread index by handle");
-                    handleIndex = -1;
-                }
             }
             setFakeDebugEvent(info);
+            if (gSessionKind != UE_SESSION_LIVE)
+            {
+                std::lock_guard lock(gMutexHandleRegistry);
+                const auto found = gHandleRegistry.find(info.hThread);
+                if (found != gHandleRegistry.end())
+                    gFakeDebugEvent.dwThreadId = found->second.systemId;
+            }
             dispatchDebugEvent(UE_CH_CREATETHREAD, &info);
             return true;
         };
@@ -1223,18 +1270,18 @@ public:
                 }
                 gDebugIdMap.processHandleToIndex[info.hProcess] = processIndex;
                 gDebugIdMap.processIndexToHandle[processIndex] = info.hProcess;
-                registerTitanHandle(info.hProcess, TitanHandleType::Process, processIndex, debugProcessId(), false);
-
-                // NOTE: sanity check
-                ULONG handleIndex = 0;
-                hr = gDebugSystemObjects->GetProcessIdByHandle(Handle, &handleIndex);
-                if (FAILED(hr))
+                if (gSessionKind == UE_SESSION_LIVE)
                 {
-                    logError("Failed to get event process index by handle");
-                    handleIndex = -1;
+                    registerTitanHandle(info.hProcess, TitanHandleType::Process, processIndex, debugProcessId(), false);
+
+                    // NOTE: sanity check
+                    ULONG handleIndex = 0;
+                    hr = gDebugSystemObjects->GetProcessIdByHandle(Handle, &handleIndex);
+                    if (FAILED(hr))
+                        logError("Failed to get event process index by handle");
+                    else if (handleIndex != processIndex)
+                        logError("Process index mismatch: current {}, handle {}", processIndex, handleIndex);
                 }
-                if (handleIndex != processIndex)
-                    logError("Process index mismatch: current {}, handle {}", processIndex, handleIndex);
             }
             {
                 ULONG threadIndex = 0;
@@ -1246,15 +1293,15 @@ public:
                 }
                 gDebugIdMap.threadHandleToIndex[info.hThread] = threadIndex;
                 gDebugIdMap.threadIndexToHandle[threadIndex] = info.hThread;
-                registerTitanHandle(info.hThread, TitanHandleType::Thread, threadIndex, debugThreadId(), false);
-
-                // NOTE: sanity check
-                ULONG handleIndex = 0;
-                hr = gDebugSystemObjects->GetThreadIdByHandle(InitialThreadHandle, &handleIndex);
-                if (FAILED(hr))
+                if (gSessionKind == UE_SESSION_LIVE)
                 {
-                    logError("Failed to get event thread index by handle");
-                    handleIndex = -1;
+                    registerTitanHandle(info.hThread, TitanHandleType::Thread, threadIndex, debugThreadId(), false);
+
+                    // NOTE: sanity check
+                    ULONG handleIndex = 0;
+                    hr = gDebugSystemObjects->GetThreadIdByHandle(InitialThreadHandle, &handleIndex);
+                    if (FAILED(hr))
+                        logError("Failed to get event thread index by handle");
                 }
             }
 
@@ -1658,6 +1705,22 @@ struct RegisterCache
                         // NOTE: no break on purpose due to aliases
                     }
                 }
+                if (_stricmp(name, "efl") == 0)
+                {
+                    TitanRegIndexMap[UE_EFLAGS] = i;
+                    TitanRegIndexMap[UE_RFLAGS] = i;
+                }
+#ifdef _WIN64
+                else if (_stricmp(name, "rip") == 0)
+                    TitanRegIndexMap[UE_CIP] = i;
+                else if (_stricmp(name, "rsp") == 0)
+                    TitanRegIndexMap[UE_CSP] = i;
+#else
+                if (_stricmp(name, "eip") == 0)
+                    TitanRegIndexMap[UE_CIP] = i;
+                else if (_stricmp(name, "esp") == 0)
+                    TitanRegIndexMap[UE_CSP] = i;
+#endif
             }
         }
 
@@ -1747,6 +1810,16 @@ struct RegisterCache
         }
         Changed[index] = true;
         return true;
+    }
+
+    const DEBUG_VALUE* FindValue(const char* name) const
+    {
+        for (size_t i = 0; i < Names.size(); ++i)
+        {
+            if (_stricmp(Names[i].c_str(), name) == 0 && Values[i].Type != DEBUG_VALUE_INVALID)
+                return &Values[i];
+        }
+        return nullptr;
     }
 
     ULONG_PTR GetValue(TitanRegister reg)
@@ -2252,6 +2325,25 @@ __declspec(dllexport) bool MemoryReadUnsafe(HANDLE hProcess, LPCVOID lpBaseAddre
         return false;
     }
 
+    if (gSessionKind == UE_SESSION_MINIDUMP || gSessionKind == UE_SESSION_TTD)
+    {
+        if (nSize > ULONG_MAX)
+        {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return false;
+        }
+        ULONG bytesRead = 0;
+        hr = gDebugDataSpaces->ReadVirtual((ULONG64)(ULONG_PTR)lpBaseAddress, lpBuffer, (ULONG)nSize, &bytesRead);
+        if (lpNumberOfBytesRead)
+            *lpNumberOfBytesRead = bytesRead;
+        if (FAILED(hr) || bytesRead != nSize)
+        {
+            SetLastError(bytesRead ? ERROR_PARTIAL_COPY : ERROR_READ_FAULT);
+            return false;
+        }
+        return true;
+    }
+
     // Read the live process directly so DbgEng cannot substitute original
     // bytes for software breakpoints. Watched pages are exposed only for the
     // duration of this debugger read and are re-guarded before returning.
@@ -2322,6 +2414,11 @@ __declspec(dllexport) bool MemoryWriteSafe(HANDLE hProcess, LPVOID lpBaseAddress
         SetLastError(ERROR_BUSY);
         return false;
     }
+    if (gSessionKind == UE_SESSION_MINIDUMP || gSessionKind == UE_SESSION_TTD)
+    {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
 
     ULONG written = 0;
     auto hr = gDebugDataSpaces->WriteVirtual((ULONG64)(ULONG_PTR)lpBaseAddress, const_cast<PVOID>(lpBuffer), (ULONG)nSize, &written);
@@ -2343,21 +2440,61 @@ __declspec(dllexport) SIZE_T MemoryQuerySafe(HANDLE hProcess, LPCVOID lpAddress,
         SetLastError(ERROR_INVALID_PARAMETER);
         return 0;
     }
+    if (gSessionKind == UE_SESSION_MINIDUMP || gSessionKind == UE_SESSION_TTD)
+    {
+        PauseLock pl;
+        if (!pl || !gDebugIdMap.processHandleToIndex.contains(hProcess))
+        {
+            SetLastError(pl ? ERROR_INVALID_HANDLE : ERROR_BUSY);
+            return 0;
+        }
+        MEMORY_BASIC_INFORMATION64 info = {};
+        const auto hr = gDebugDataSpaces->QueryVirtual((ULONG64)(ULONG_PTR)lpAddress, &info);
+        if (FAILED(hr))
+        {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return 0;
+        }
+        *lpBuffer = {};
+        lpBuffer->BaseAddress = (PVOID)(ULONG_PTR)info.BaseAddress;
+        lpBuffer->AllocationBase = (PVOID)(ULONG_PTR)info.AllocationBase;
+        lpBuffer->AllocationProtect = info.AllocationProtect;
+        lpBuffer->RegionSize = (SIZE_T)info.RegionSize;
+        lpBuffer->State = info.State;
+        lpBuffer->Protect = info.Protect;
+        lpBuffer->Type = info.Type;
+        return sizeof(*lpBuffer);
+    }
     return VirtualQueryEx(hProcess, lpAddress, lpBuffer, dwLength);
 }
 
 __declspec(dllexport) LPVOID MemoryAllocSafe(HANDLE hProcess, LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect)
 {
+    if (gSessionKind == UE_SESSION_MINIDUMP || gSessionKind == UE_SESSION_TTD)
+    {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return nullptr;
+    }
     return VirtualAllocEx(hProcess, lpAddress, dwSize, flAllocationType, flProtect);
 }
 
 __declspec(dllexport) bool MemoryFreeSafe(HANDLE hProcess, LPVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType)
 {
+    if (gSessionKind == UE_SESSION_MINIDUMP || gSessionKind == UE_SESSION_TTD)
+    {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
     return !!VirtualFreeEx(hProcess, lpAddress, dwSize, dwFreeType);
 }
 
 __declspec(dllexport) bool MemoryProtectSafe(HANDLE hProcess, LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect)
 {
+    if (gSessionKind == UE_SESSION_MINIDUMP || gSessionKind == UE_SESSION_TTD)
+    {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
     return !!VirtualProtectEx(hProcess, lpAddress, dwSize, flNewProtect, lpflOldProtect);
 }
 
@@ -2415,6 +2552,7 @@ __declspec(dllexport) PROCESS_INFORMATION* InitDebugW(const wchar_t* szFileName,
     }
 
     gProcessInfo = {};
+    ++gSessionGeneration;
     ResetEvent(gProcessCreatedEvent);
     gDebugThreadId = GetCurrentThreadId();
     gExpectSystemBreakpoint = true;
@@ -2471,12 +2609,293 @@ __declspec(dllexport) PROCESS_INFORMATION* InitDebugW(const wchar_t* szFileName,
     registerTitanHandle(initThread, TitanHandleType::Thread, DEBUG_ANY_ID, gProcessInfo.dwThreadId, true);
     gProcessInfo.hProcess = initProcess;
     gProcessInfo.hThread = initThread;
+    gSessionKind = UE_SESSION_LIVE;
     return &gProcessInfo;
+}
+
+__declspec(dllexport) PROCESS_INFORMATION* InitReplayW(const wchar_t* szArtifactPath, TitanSessionKind ExpectedKind)
+{
+    if (!szArtifactPath || !*szArtifactPath ||
+        (ExpectedKind != UE_SESSION_MINIDUMP && ExpectedKind != UE_SESSION_TTD))
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    if (gSessionKind != UE_SESSION_NONE || gIsDebugging)
+    {
+        SetLastError(ERROR_BUSY);
+        return nullptr;
+    }
+
+    gProcessInfo = {};
+    gDebugIdMap = {};
+    gProcessPebCache = {};
+    gProcessTebCache = {};
+    closeCallerOwnedTitanHandles();
+    ++gSessionGeneration;
+    gDebugThreadId = GetCurrentThreadId();
+    gExpectSystemBreakpoint = false;
+    gNextExecutionStatus = DEBUG_STATUS_NO_CHANGE;
+    gNextContinueStatus = DBG_CONTINUE;
+    {
+        std::lock_guard lock(gMutexCallbackQueue);
+        gCallbackQueue = {};
+    }
+
+    auto fail = [](HRESULT hr, DWORD fallbackError) -> PROCESS_INFORMATION*
+    {
+        if (gDebugClient)
+            gDebugClient->EndSession(DEBUG_END_PASSIVE);
+        {
+            std::lock_guard lock(gMutexCallbackQueue);
+            gCallbackQueue = {};
+        }
+        gProcessInfo = {};
+        gDebugIdMap = {};
+        gProcessPebCache = {};
+        gProcessTebCache = {};
+        closeCallerOwnedTitanHandles();
+        gSessionKind = UE_SESSION_NONE;
+        const auto error = FAILED(hr) && HRESULT_FACILITY(hr) == FACILITY_WIN32 && HRESULT_CODE(hr)
+                               ? HRESULT_CODE(hr)
+                               : fallbackError;
+        SetLastError(error);
+        return nullptr;
+    };
+
+    auto hr = gDebugClient->OpenDumpFileWide(szArtifactPath, 0);
+    if (FAILED(hr))
+    {
+        logError("OpenDumpFileWide failed: {:#x}", (uint32_t)hr);
+        return fail(hr, ERROR_BAD_FORMAT);
+    }
+    hr = gDebugControl->WaitForEvent(DEBUG_WAIT_DEFAULT, INFINITE);
+    if (FAILED(hr))
+    {
+        logError("Initial replay WaitForEvent failed: {:#x}", (uint32_t)hr);
+        return fail(hr, ERROR_BAD_FORMAT);
+    }
+
+    ULONG debugClass = 0;
+    ULONG qualifier = 0;
+    hr = gDebugControl->GetDebuggeeType(&debugClass, &qualifier);
+    if (FAILED(hr) || debugClass != DEBUG_CLASS_USER_WINDOWS)
+    {
+        logError("Unsupported replay debuggee type: class {}, qualifier {}, hr {:#x}", debugClass, qualifier, (uint32_t)hr);
+        return fail(hr, ERROR_NOT_SUPPORTED);
+    }
+    const auto detectedKind = qualifier == DEBUG_DUMP_TRACE_LOG ? UE_SESSION_TTD : UE_SESSION_MINIDUMP;
+    if (detectedKind != ExpectedKind)
+    {
+        logError("Replay kind mismatch: expected {}, detected {} (qualifier {})", (uint32_t)ExpectedKind, (uint32_t)detectedKind, qualifier);
+        return fail(E_INVALIDARG, ERROR_BAD_FORMAT);
+    }
+    if (detectedKind == UE_SESSION_TTD)
+    {
+        logError("TTD trace opening is recognized but navigation is not implemented yet");
+        return fail(E_NOTIMPL, ERROR_NOT_SUPPORTED);
+    }
+
+    ULONG processCount = 0;
+    hr = gDebugSystemObjects->GetNumberProcesses(&processCount);
+    if (FAILED(hr) || processCount != 1)
+    {
+        logError("Replay requires exactly one process, found {}, hr {:#x}", processCount, (uint32_t)hr);
+        return fail(hr, ERROR_NOT_SUPPORTED);
+    }
+
+    ULONG processIndex = DEBUG_ANY_ID;
+    ULONG threadIndex = DEBUG_ANY_ID;
+    ULONG processSystemId = 0;
+    ULONG threadSystemId = 0;
+    if (FAILED(hr = gDebugSystemObjects->GetCurrentProcessId(&processIndex)) ||
+        FAILED(hr = gDebugSystemObjects->GetCurrentThreadId(&threadIndex)) ||
+        FAILED(hr = gDebugSystemObjects->GetCurrentProcessSystemId(&processSystemId)) ||
+        FAILED(hr = gDebugSystemObjects->GetCurrentThreadSystemId(&threadSystemId)))
+    {
+        logError("Failed to query replay process/thread identity: {:#x}", (uint32_t)hr);
+        return fail(hr, ERROR_BAD_FORMAT);
+    }
+
+    ULONG threadCount = 0;
+    hr = gDebugSystemObjects->GetNumberThreads(&threadCount);
+    if (FAILED(hr) || !threadCount)
+    {
+        logError("Replay has no queryable threads: {:#x}", (uint32_t)hr);
+        return fail(hr, ERROR_BAD_FORMAT);
+    }
+    std::vector<ULONG> threadEngineIds(threadCount);
+    std::vector<ULONG> threadSystemIds(threadCount);
+    hr = gDebugSystemObjects->GetThreadIdsByIndex(0, threadCount, threadEngineIds.data(), threadSystemIds.data());
+    if (FAILED(hr))
+    {
+        logError("GetThreadIdsByIndex failed: {:#x}", (uint32_t)hr);
+        return fail(hr, ERROR_BAD_FORMAT);
+    }
+
+    const auto eventProcess = createSyntheticTitanHandle(TitanHandleType::Process, processIndex, processSystemId, false);
+    const auto eventThread = createSyntheticTitanHandle(TitanHandleType::Thread, threadIndex, threadSystemId, false);
+    gDebugIdMap.processIndexToHandle[processIndex] = eventProcess;
+    gDebugIdMap.processHandleToIndex[eventProcess] = processIndex;
+    gDebugIdMap.threadIndexToHandle[threadIndex] = eventThread;
+    gDebugIdMap.threadHandleToIndex[eventThread] = threadIndex;
+
+    ULONG64 peb = 0;
+    ULONG64 teb = 0;
+    gDebugSystemObjects->GetCurrentProcessPeb(&peb);
+    gDebugSystemObjects->GetCurrentThreadTeb(&teb);
+    gProcessPebCache[eventProcess] = peb;
+    gProcessTebCache[eventThread] = teb;
+
+    ULONG64 imageBase = 0;
+    ULONG64 instruction = 0;
+    gDebugSymbols->GetModuleByIndex(0, &imageBase);
+    gDebugRegisters->GetInstructionOffset(&instruction);
+
+    EXCEPTION_DEBUG_INFO initialException = {};
+    initialException.ExceptionRecord.ExceptionCode = EXCEPTION_BREAKPOINT;
+    initialException.ExceptionRecord.ExceptionAddress = (PVOID)(ULONG_PTR)instruction;
+    ULONG eventType = 0;
+    ULONG eventProcessIndex = 0;
+    ULONG eventThreadIndex = 0;
+    ULONG extraUsed = 0;
+    EXCEPTION_RECORD64 exception64 = {};
+    if (SUCCEEDED(gDebugControl->GetLastEventInformationWide(&eventType, &eventProcessIndex, &eventThreadIndex,
+                                                             &exception64, sizeof(exception64), &extraUsed,
+                                                             nullptr, 0, nullptr)) &&
+        eventType == DEBUG_EVENT_EXCEPTION && extraUsed >= sizeof(exception64))
+    {
+        initialException.ExceptionRecord.ExceptionCode = exception64.ExceptionCode;
+        initialException.ExceptionRecord.ExceptionFlags = exception64.ExceptionFlags;
+        initialException.ExceptionRecord.ExceptionRecord = (PEXCEPTION_RECORD)(ULONG_PTR)exception64.ExceptionRecord;
+        initialException.ExceptionRecord.ExceptionAddress = (PVOID)(ULONG_PTR)exception64.ExceptionAddress;
+        initialException.ExceptionRecord.NumberParameters = (DWORD)(std::min)(exception64.NumberParameters, (ULONG)EXCEPTION_MAXIMUM_PARAMETERS);
+        for (DWORD i = 0; i < initialException.ExceptionRecord.NumberParameters; ++i)
+            initialException.ExceptionRecord.ExceptionInformation[i] = (ULONG_PTR)exception64.ExceptionInformation[i];
+    }
+
+    gProcessInfo.hProcess = eventProcess;
+    gProcessInfo.hThread = eventThread;
+    gProcessInfo.dwProcessId = processSystemId;
+    gProcessInfo.dwThreadId = threadSystemId;
+    gSessionKind = detectedKind;
+
+    // DbgEng reports a dump's stored exception but does not emit the live
+    // create-process/thread/module bootstrap required by x64dbg. Discard the
+    // pre-bootstrap callbacks and synthesize a deterministic snapshot.
+    {
+        std::lock_guard lock(gMutexCallbackQueue);
+        gCallbackQueue = {};
+    }
+    gEventCallbacks->CreateProcess(0, (ULONG64)(uintptr_t)eventProcess, imageBase, 0, nullptr, nullptr, 0, 0,
+                                   (ULONG64)(uintptr_t)eventThread, teb, instruction);
+
+    for (ULONG i = 0; i < threadCount; ++i)
+    {
+        if (threadEngineIds[i] == threadIndex)
+            continue;
+        const auto token = createSyntheticTitanHandle(TitanHandleType::Thread, threadEngineIds[i], threadSystemIds[i], false);
+        gDebugIdMap.threadIndexToHandle[threadEngineIds[i]] = token;
+        gDebugIdMap.threadHandleToIndex[token] = threadEngineIds[i];
+
+        ULONG64 threadTeb = 0;
+        if (SUCCEEDED(gDebugSystemObjects->SetCurrentThreadId(threadEngineIds[i])))
+            gDebugSystemObjects->GetCurrentThreadTeb(&threadTeb);
+        gProcessTebCache[token] = threadTeb;
+        gEventCallbacks->CreateThread((ULONG64)(uintptr_t)token, threadTeb, 0);
+    }
+    gDebugSystemObjects->SetCurrentThreadId(threadIndex);
+
+    ULONG loadedModules = 0;
+    ULONG unloadedModules = 0;
+    if (SUCCEEDED(gDebugSymbols->GetNumberModules(&loadedModules, &unloadedModules)))
+    {
+        for (ULONG i = 1; i < loadedModules; ++i)
+        {
+            ULONG64 base = 0;
+            if (SUCCEEDED(gDebugSymbols->GetModuleByIndex(i, &base)))
+                gEventCallbacks->LoadModule(0, base, 0, nullptr, nullptr, 0, 0);
+        }
+    }
+    queueCallback([initialException]
+    {
+        setFakeDebugEvent(initialException);
+        dispatchSystemBreakpoint(&initialException);
+        return true;
+    });
+
+    const auto initProcess = createSyntheticTitanHandle(TitanHandleType::Process, processIndex, processSystemId, true);
+    const auto initThread = createSyntheticTitanHandle(TitanHandleType::Thread, threadIndex, threadSystemId, true);
+    gDebugIdMap.processHandleToIndex[initProcess] = processIndex;
+    gDebugIdMap.threadHandleToIndex[initThread] = threadIndex;
+    gProcessPebCache[initProcess] = peb;
+    gProcessTebCache[initThread] = teb;
+    gProcessInfo.hProcess = initProcess;
+    gProcessInfo.hThread = initThread;
+    return &gProcessInfo;
+}
+
+__declspec(dllexport) bool GetSessionInfo(TITAN_SESSION_INFO* SessionInfo)
+{
+    if (!SessionInfo)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    *SessionInfo = {};
+    SessionInfo->structSize = sizeof(*SessionInfo);
+    SessionInfo->kind = gSessionKind.load();
+    if (SessionInfo->kind == UE_SESSION_NONE)
+        return true;
+
+    if (SessionInfo->kind == UE_SESSION_LIVE)
+    {
+        SessionInfo->capabilities = UE_SESSION_CAP_MEMORY_READ | UE_SESSION_CAP_MEMORY_QUERY |
+                                    UE_SESSION_CAP_CONTEXT_READ | UE_SESSION_CAP_FORWARD_EXECUTION |
+                                    UE_SESSION_CAP_MEMORY_WRITE | UE_SESSION_CAP_CONTEXT_WRITE |
+                                    UE_SESSION_CAP_PROCESS_CONTROL | UE_SESSION_CAP_THREAD_CONTROL |
+                                    UE_SESSION_CAP_NATIVE_HANDLES | UE_SESSION_CAP_EXCEPTION_CONTINUE;
+    }
+    else if (SessionInfo->kind == UE_SESSION_MINIDUMP)
+    {
+        SessionInfo->capabilities = UE_SESSION_CAP_MEMORY_READ | UE_SESSION_CAP_MEMORY_QUERY |
+                                    UE_SESSION_CAP_CONTEXT_READ;
+    }
+
+#ifdef _WIN64
+    SessionInfo->machineType = IMAGE_FILE_MACHINE_AMD64;
+#else
+    SessionInfo->machineType = IMAGE_FILE_MACHINE_I386;
+#endif
+    if (gDebugControl)
+    {
+        ULONG machineType = 0;
+        if (SUCCEEDED(gDebugControl->GetEffectiveProcessorType(&machineType)))
+            SessionInfo->machineType = machineType;
+    }
+    SessionInfo->processId = debugProcessId();
+    SessionInfo->threadId = debugThreadId();
+    return true;
 }
 
 __declspec(dllexport) bool StopDebug()
 {
-    auto hr = gDebugClient->EndSession(DEBUG_END_ACTIVE_TERMINATE);
+    const auto kind = gSessionKind.load();
+    const auto endMode = kind == UE_SESSION_LIVE ? DEBUG_END_ACTIVE_TERMINATE : DEBUG_END_PASSIVE;
+    auto hr = gDebugClient->EndSession(endMode);
+    if (SUCCEEDED(hr) && !gIsDebugging && kind != UE_SESSION_LIVE)
+    {
+        gProcessInfo = {};
+        gProcessPebCache = {};
+        gProcessTebCache = {};
+        closeCallerOwnedTitanHandles();
+        gDebugIdMap = {};
+        {
+            std::lock_guard lock(gMutexCallbackQueue);
+            gCallbackQueue = {};
+        }
+        gSessionKind = UE_SESSION_NONE;
+    }
     return SUCCEEDED(hr);
 }
 
@@ -2755,6 +3174,41 @@ __declspec(dllexport) bool RemoveMemoryBPX(ULONG_PTR MemoryStart, SIZE_T SizeOfM
     return false;
 }
 
+static void readReplayExtendedContext(TITAN_ENGINE_CONTEXT_t* titcontext)
+{
+    titcontext->x87fpu.ControlWord = (WORD)gRegisterCache.GetValue(UE_X87_CONTROLWORD);
+    titcontext->x87fpu.StatusWord = (WORD)gRegisterCache.GetValue(UE_X87_STATUSWORD);
+    titcontext->x87fpu.TagWord = (WORD)gRegisterCache.GetValue(UE_X87_TAGWORD);
+    titcontext->MxCsr = (DWORD)gRegisterCache.GetValue(UE_MXCSR);
+
+    char name[16] = {};
+    for (size_t i = 0; i < 8; ++i)
+    {
+        std::snprintf(name, sizeof(name), "st%zu", i);
+        if (const auto* value = gRegisterCache.FindValue(name))
+        {
+            if (value->Type == DEBUG_VALUE_FLOAT80 || value->Type == DEBUG_VALUE_FLOAT82)
+                memcpy(titcontext->RegisterArea + i * 10, value->F80Bytes, 10);
+        }
+    }
+    for (size_t i = 0; i < std::size(titcontext->XmmRegisters); ++i)
+    {
+        std::snprintf(name, sizeof(name), "xmm%zu", i);
+        if (const auto* value = gRegisterCache.FindValue(name))
+        {
+            if (value->Type == DEBUG_VALUE_VECTOR128)
+                memcpy(&titcontext->XmmRegisters[i], value->VI8, sizeof(XmmRegister_t));
+        }
+        titcontext->YmmRegisters[i].Low = titcontext->XmmRegisters[i];
+        std::snprintf(name, sizeof(name), "ymm%zu", i);
+        if (const auto* value = gRegisterCache.FindValue(name))
+        {
+            if (value->Type == DEBUG_VALUE_VECTOR128)
+                memcpy(&titcontext->YmmRegisters[i].High, value->VI8, sizeof(XmmRegister_t));
+        }
+    }
+}
+
 __declspec(dllexport) bool GetFullContextDataEx(HANDLE hActiveThread, TITAN_ENGINE_CONTEXT_t* titcontext)
 {
     if (!titcontext)
@@ -2820,6 +3274,12 @@ __declspec(dllexport) bool GetFullContextDataEx(HANDLE hActiveThread, TITAN_ENGI
     titcontext->dr7 = gRegisterCache.GetValue(UE_DR7);
     titcontext->MxCsr = (DWORD)gRegisterCache.GetValue(UE_MXCSR);
 
+    if (gSessionKind == UE_SESSION_MINIDUMP || gSessionKind == UE_SESSION_TTD)
+    {
+        readReplayExtendedContext(titcontext);
+        return true;
+    }
+
     NativeContextBuffer native;
     if (!native.Load(hActiveThread, XSTATE_MASK_AVX))
     {
@@ -2833,6 +3293,11 @@ __declspec(dllexport) bool GetFullContextDataEx(HANDLE hActiveThread, TITAN_ENGI
 
 __declspec(dllexport) bool SetFullContextDataEx(HANDLE hActiveThread, TITAN_ENGINE_CONTEXT_t* titcontext)
 {
+    if (gSessionKind == UE_SESSION_MINIDUMP || gSessionKind == UE_SESSION_TTD)
+    {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
     if (!titcontext)
     {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -2948,6 +3413,11 @@ __declspec(dllexport) ULONG_PTR GetContextDataEx(HANDLE hActiveThread, TitanRegi
 
 __declspec(dllexport) bool SetContextDataEx(HANDLE hActiveThread, TitanRegister IndexOfRegister, ULONG_PTR NewRegisterValue)
 {
+    if (gSessionKind == UE_SESSION_MINIDUMP || gSessionKind == UE_SESSION_TTD)
+    {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
     PauseLock pl;
     if (!pl)
         return false;
@@ -3026,6 +3496,11 @@ __declspec(dllexport) bool GetAVX512Context(HANDLE hActiveThread, TITAN_ENGINE_C
 
 __declspec(dllexport) bool SetAVX512Context(HANDLE hActiveThread, TITAN_ENGINE_CONTEXT_AVX512_t* titcontext)
 {
+    if (gSessionKind == UE_SESSION_MINIDUMP || gSessionKind == UE_SESSION_TTD)
+    {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
     if (!titcontext)
     {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -3580,6 +4055,11 @@ __declspec(dllexport) void DebugLoop()
         }
         if (gNextExecutionStatus != DEBUG_STATUS_NO_CHANGE)
         {
+            if (gSessionKind == UE_SESSION_MINIDUMP && gNextExecutionStatus == DEBUG_STATUS_BREAK)
+            {
+                gNextExecutionStatus = DEBUG_STATUS_NO_CHANGE;
+                continue;
+            }
             ULONG currentStatus = DEBUG_STATUS_NO_DEBUGGEE;
             const auto statusHr = gDebugControl->GetExecutionStatus(&currentStatus);
             if (FAILED(statusHr) || currentStatus != DEBUG_STATUS_NO_DEBUGGEE)
@@ -3617,6 +4097,7 @@ __declspec(dllexport) void DebugLoop()
     gStepStatuses = {};
     gRetiredBreakpointAddresses = {};
     gAttachCallback = nullptr;
+    gSessionKind = UE_SESSION_NONE;
 }
 
 __declspec(dllexport) void SetNextDbgContinueStatus(DWORD SetDbgCode)
@@ -3640,6 +4121,7 @@ __declspec(dllexport) bool AttachDebugger(DWORD ProcessId, bool KillOnExit, LPVO
     }
 
     gProcessInfo = {};
+    ++gSessionGeneration;
     ResetEvent(gProcessCreatedEvent);
     gDebugThreadId = GetCurrentThreadId();
     gExpectSystemBreakpoint = true;
@@ -3676,6 +4158,7 @@ __declspec(dllexport) bool AttachDebugger(DWORD ProcessId, bool KillOnExit, LPVO
         return false;
     }
 
+    gSessionKind = UE_SESSION_LIVE;
     *static_cast<PROCESS_INFORMATION*>(DebugInfo) = gProcessInfo;
     DebugLoop();
     return true;
@@ -3704,6 +4187,21 @@ __declspec(dllexport) bool IsFileBeingDebugged()
 // TitanEngine.Process.functions:
 __declspec(dllexport) HANDLE TitanOpenProcess(DWORD dwDesiredAccess, bool bInheritHandle, DWORD dwProcessId)
 {
+    if (gSessionKind == UE_SESSION_MINIDUMP || gSessionKind == UE_SESSION_TTD)
+    {
+        ULONG processIndex = DEBUG_ANY_ID;
+        if (dwProcessId != debugProcessId() || FAILED(gDebugSystemObjects->GetCurrentProcessId(&processIndex)))
+        {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+        const auto handle = createSyntheticTitanHandle(TitanHandleType::Process, processIndex, dwProcessId, true);
+        gDebugIdMap.processHandleToIndex[handle] = processIndex;
+        ULONG64 peb = 0;
+        gDebugSystemObjects->GetCurrentProcessPeb(&peb);
+        gProcessPebCache[handle] = peb;
+        return handle;
+    }
     auto handle = OpenProcess(dwDesiredAccess, bInheritHandle, dwProcessId);
     registerTitanHandle(handle, TitanHandleType::Process, DEBUG_ANY_ID, dwProcessId, true);
     return handle;
@@ -3711,23 +4209,104 @@ __declspec(dllexport) HANDLE TitanOpenProcess(DWORD dwDesiredAccess, bool bInher
 
 __declspec(dllexport) HANDLE TitanOpenThread(DWORD dwDesiredAccess, bool bInheritHandle, DWORD dwThreadId)
 {
+    if (gSessionKind == UE_SESSION_MINIDUMP || gSessionKind == UE_SESSION_TTD)
+    {
+        ULONG count = 0;
+        if (FAILED(gDebugSystemObjects->GetNumberThreads(&count)) || !count)
+            return nullptr;
+        std::vector<ULONG> engineIds(count);
+        std::vector<ULONG> systemIds(count);
+        if (FAILED(gDebugSystemObjects->GetThreadIdsByIndex(0, count, engineIds.data(), systemIds.data())))
+            return nullptr;
+        for (ULONG i = 0; i < count; ++i)
+        {
+            if (systemIds[i] != dwThreadId)
+                continue;
+            const auto handle = createSyntheticTitanHandle(TitanHandleType::Thread, engineIds[i], dwThreadId, true);
+            gDebugIdMap.threadHandleToIndex[handle] = engineIds[i];
+            ULONG oldIndex = DEBUG_ANY_ID;
+            ULONG64 teb = 0;
+            gDebugSystemObjects->GetCurrentThreadId(&oldIndex);
+            if (SUCCEEDED(gDebugSystemObjects->SetCurrentThreadId(engineIds[i])))
+                gDebugSystemObjects->GetCurrentThreadTeb(&teb);
+            if (oldIndex != DEBUG_ANY_ID)
+                gDebugSystemObjects->SetCurrentThreadId(oldIndex);
+            gProcessTebCache[handle] = teb;
+            return handle;
+        }
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
     auto handle = OpenThread(dwDesiredAccess, bInheritHandle, dwThreadId);
     registerTitanHandle(handle, TitanHandleType::Thread, DEBUG_ANY_ID, dwThreadId, true);
     return handle;
+}
+
+__declspec(dllexport) bool TitanGetProcessImagePathW(HANDLE hProcess, LPWSTR szPath, SIZE_T cchPath)
+{
+    if (!hProcess || !szPath || !cchPath || cchPath > ULONG_MAX ||
+        !gDebugIdMap.processHandleToIndex.contains(hProcess))
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    ULONG64 base = 0;
+    auto hr = gDebugSymbols->GetModuleByIndex(0, &base);
+    if (SUCCEEDED(hr))
+        hr = gDebugSymbols->GetModuleNameStringWide(DEBUG_MODNAME_IMAGE, 0, base, szPath, (ULONG)cchPath, nullptr);
+    if (FAILED(hr))
+    {
+        if (cchPath)
+            *szPath = L'\0';
+        SetLastError(ERROR_NOT_FOUND);
+        return false;
+    }
+    return true;
+}
+
+__declspec(dllexport) bool TitanGetModulePathW(HANDLE hProcess, ULONG_PTR ModuleBase, LPWSTR szPath, SIZE_T cchPath)
+{
+    if (!hProcess || !ModuleBase || !szPath || !cchPath || cchPath > ULONG_MAX ||
+        !gDebugIdMap.processHandleToIndex.contains(hProcess))
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    ULONG index = DEBUG_ANY_ID;
+    ULONG64 base = 0;
+    auto hr = gDebugSymbols->GetModuleByOffset((ULONG64)ModuleBase, 0, &index, &base);
+    if (SUCCEEDED(hr) && base == (ULONG64)ModuleBase)
+        hr = gDebugSymbols->GetModuleNameStringWide(DEBUG_MODNAME_IMAGE, index, base, szPath, (ULONG)cchPath, nullptr);
+    else if (SUCCEEDED(hr))
+        hr = E_INVALIDARG;
+    if (FAILED(hr))
+    {
+        if (cchPath)
+            *szPath = L'\0';
+        SetLastError(ERROR_NOT_FOUND);
+        return false;
+    }
+    return true;
 }
 
 __declspec(dllexport) bool TitanCloseHandle(HANDLE hEngineHandle)
 {
     std::lock_guard lock(gMutexHandleRegistry);
     const auto found = gHandleRegistry.find(hEngineHandle);
-    if (found == gHandleRegistry.end() || !found->second.callerOwned || !found->second.nativeHandle)
+    if (found == gHandleRegistry.end() || !found->second.callerOwned)
     {
         SetLastError(ERROR_INVALID_HANDLE);
         return false;
     }
-    const auto result = !!CloseHandle(found->second.nativeHandle);
+    const auto result = !found->second.nativeHandle || !!CloseHandle(found->second.nativeHandle);
     if (result)
+    {
+        gDebugIdMap.processHandleToIndex.erase(hEngineHandle);
+        gDebugIdMap.threadHandleToIndex.erase(hEngineHandle);
+        gProcessPebCache.erase(hEngineHandle);
+        gProcessTebCache.erase(hEngineHandle);
         gHandleRegistry.erase(found);
+    }
     return result;
 }
 
@@ -3756,7 +4335,17 @@ __declspec(dllexport) HANDLE TitanCreateRemoteThread(HANDLE hProcess, LPTHREAD_S
 __declspec(dllexport) DWORD TitanSuspendThread(HANDLE hThread) { const auto h = registeredNativeHandle(hThread, TitanHandleType::Thread); return h ? SuspendThread(h) : (DWORD)-1; }
 __declspec(dllexport) DWORD TitanResumeThread(HANDLE hThread) { const auto h = registeredNativeHandle(hThread, TitanHandleType::Thread); return h ? ResumeThread(h) : (DWORD)-1; }
 __declspec(dllexport) bool TitanTerminateThread(HANDLE hThread, DWORD exitCode) { const auto h = registeredNativeHandle(hThread, TitanHandleType::Thread); return h && !!TerminateThread(h, exitCode); }
-__declspec(dllexport) DWORD TitanGetThreadId(HANDLE hThread) { const auto h = registeredNativeHandle(hThread, TitanHandleType::Thread); return h ? GetThreadId(h) : 0; }
+__declspec(dllexport) DWORD TitanGetThreadId(HANDLE hThread)
+{
+    std::lock_guard lock(gMutexHandleRegistry);
+    const auto found = gHandleRegistry.find(hThread);
+    if (found == gHandleRegistry.end() || found->second.type != TitanHandleType::Thread)
+    {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    return found->second.nativeHandle ? GetThreadId(found->second.nativeHandle) : found->second.systemId;
+}
 __declspec(dllexport) int TitanGetThreadPriority(HANDLE hThread) { const auto h = registeredNativeHandle(hThread, TitanHandleType::Thread); return h ? GetThreadPriority(h) : THREAD_PRIORITY_ERROR_RETURN; }
 __declspec(dllexport) bool TitanSetThreadPriority(HANDLE hThread, int priority) { const auto h = registeredNativeHandle(hThread, TitanHandleType::Thread); return h && !!SetThreadPriority(h, priority); }
 __declspec(dllexport) bool TitanGetThreadTimes(HANDLE hThread, LPFILETIME creation, LPFILETIME exit, LPFILETIME kernel, LPFILETIME user) { const auto h = registeredNativeHandle(hThread, TitanHandleType::Thread); return h && !!GetThreadTimes(h, creation, exit, kernel, user); }

@@ -10,6 +10,18 @@ compile-features = ["cxx_std_20"]
 link-libraries = ["DbgEng", "Delayimp"]
 msvc.link-options = ["/DELAYLOAD:dbgeng.dll"]
 
+[target.replay_probe]
+type = "executable"
+sources = ["src/replay_probe/replay_probe.cpp"]
+compile-features = ["cxx_std_20"]
+link-libraries = ["DbgEng", "Delayimp"]
+msvc.link-options = ["/DELAYLOAD:dbgeng.dll"]
+
+[target.shim_replay_probe]
+type = "executable"
+sources = ["src/shim_replay_probe/shim_replay_probe.cpp"]
+compile-features = ["cxx_std_20"]
+
 [target.TitanEngine]
 type = "shared"
 sources = [
