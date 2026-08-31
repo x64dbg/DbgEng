@@ -4,11 +4,15 @@ A DbgEng-based debugger and TitanEngine-compatible backend for x64dbg. The
 `playground` target provides a small command-line debugger; the `TitanEngine`
 target is the compatibility shim consumed by x64dbg.
 
-The shim currently supports live x64 launch and attach sessions, x64dbg event
-translation, software breakpoints, stepping, memory operations, general
-registers, non-current thread selection, repeatable sessions, and common
-process/thread controls. Memory/hardware breakpoints and AVX/AVX-512 transfer
-return normal unsupported results rather than interrupting the debugger.
+The shim supports live x64 and x86 launch and attach sessions, x64dbg event
+translation, short/long-INT3 and UD2 software breakpoints, DbgEng data/hardware
+breakpoints, page-guard memory breakpoints, stepping, filtered/raw memory-read operations, full
+x64 AVX/AVX-512 contexts, non-current thread selection, repeatable sessions,
+and common process/thread controls. Event, initialization, and explicitly
+opened process/thread handles are tracked in an authoritative ownership
+registry. Page-guard rearming suspends peer target threads during the hidden
+single instruction so concurrent accesses cannot escape while the guard is
+temporarily clear.
 
 ## Features
 
@@ -24,8 +28,11 @@ return normal unsupported results rather than interrupting the debugger.
 The project uses CMake for building:
 
 ```bash
-cmake -B build
-cmake --build build
+cmake -B build -A x64
+cmake --build build --config Debug
+
+cmake -B build32 -A Win32
+cmake --build build32 --config Debug
 ```
 
 **Important**: After building, copy the DbgEng DLLs to the output directory:
@@ -127,7 +134,7 @@ Breakpoint removed at 0x0000000140001234
 The debugger is built using the following components:
 
 ### Core Interfaces
-- **IDebugClient9** - Primary interface for session management
+- **IDebugClient5** - Primary interface for session management (chosen for compatibility with deployed DbgEng versions)
 - **IDebugControl** - Execution control and command processing
 - **IDebugDataSpaces** - Memory access operations
 - **IDebugRegisters** - Register read/write operations
@@ -175,7 +182,7 @@ This is a simple prototype debugger with the following limitations:
 - No stack trace functionality
 - No multi-threading support
 - No remote debugging capabilities
-- Limited to Windows x64 targets
+- The `playground` UI is x64-oriented; the TitanEngine compatibility shim also supports x86 targets
 
 ## Dependencies
 
@@ -193,7 +200,7 @@ This is a simple prototype debugger with the following limitations:
 
 ## Troubleshooting
 
-### "Failed to create IDebugClient9" Error
+### "Failed to create IDebugClient5" Error
 - Ensure DbgEng DLLs are copied to the output directory
 - Check that you're running on a supported Windows version
 - Verify Visual C++ Redistributable is installed
