@@ -503,6 +503,7 @@ namespace TTD {
 		struct MemoryBuffer* QueryMemoryBuffer(GuestAddress address, unsigned __int64 size);
 		struct TTD_Replay_ICursorView_ReplayResult* ReplayForward(struct TTD_Replay_ICursorView_ReplayResult* replay_result_out, struct Position* posMax, unsigned __int64 stepCount);
 		struct TTD_Replay_ICursorView_ReplayResult* ReplayBackward(struct TTD_Replay_ICursorView_ReplayResult* replay_result_out, struct Position* posMin, unsigned __int64 stepCount);
+		void InterruptReplay();
 		void SetCallReturnCallback(PROC_CallCallback callCallback, unsigned __int64 callback_value);
 		void SetMemoryWatchpointCallback(PROC_MemCallback memCallback, CallbackValue callback_value);
 		bool AddMemoryWatchpoint(TTD_Replay_MemoryWatchpointData* data);

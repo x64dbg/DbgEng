@@ -143,6 +143,10 @@ namespace TTD {
 #endif
 	}
 
+	void Cursor::InterruptReplay() {
+		return this->cursor->ICursor->InterruptReplay(cursor);
+	}
+
 	void Cursor::SetCallReturnCallback(PROC_CallCallback callCallback, unsigned __int64 callback_value) {
 		return this->cursor->ICursor->SetCallReturnCallback(cursor, callCallback, callback_value);
 	}

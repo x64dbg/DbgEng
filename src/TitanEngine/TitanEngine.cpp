@@ -296,7 +296,8 @@ static std::wstring gTtdImagePath;
 static std::map<ULONG64, std::wstring> gTtdActiveModules;
 static std::mutex gTtdMovementMutex;
 static std::condition_variable gTtdMovementCondition;
-static bool gTtdStopRequested = false;
+static std::atomic_bool gTtdStopRequested = false;
+static std::atomic_bool gTtdInterruptRequested = false;
 static bool gTtdCursorChanged = false;
 static bool gTtdNextRunReverse = false;
 struct TtdWatchHit
@@ -471,6 +472,7 @@ static void resetTtdSession()
     gTtdImagePath.clear();
     gTtdActiveModules.clear();
     gTtdStopRequested = false;
+    gTtdInterruptRequested = false;
     gTtdCursorChanged = false;
     gTtdNextRunReverse = false;
     gTtdWatchHit = {};
@@ -3562,7 +3564,11 @@ static bool runTtd(bool reverse)
             result = {};
             gTtdWatchHit = {};
             if (reverse)
-                gTtdCursor->ReplayBackward(&result, &movementLimit, UINT64_MAX);
+            {
+                // UINT64_MAX is treated as a zero-length reverse replay by this
+                // TTD runtime. A large finite bound preserves watchpoint search.
+                gTtdCursor->ReplayBackward(&result, &movementLimit, 0x10000000ull);
+            }
             else
                 gTtdCursor->ReplayForward(&result, &movementLimit, UINT64_MAX);
             if (result.stepCount || !gTtdWatchHit.pending)
@@ -3587,6 +3593,8 @@ static bool runTtd(bool reverse)
             ULONG64 totalSteps = 0;
             for (size_t i = 0; i < 1000000; ++i)
             {
+                if (gTtdStopRequested || gTtdInterruptRequested)
+                    break;
                 TTD::TTD_Replay_ICursorView_ReplayResult singleStep = {};
                 gTtdWatchHit = {};
                 gTtdCursor->ReplayBackward(&singleStep, &movementLimit, 1);
@@ -3625,6 +3633,28 @@ static bool runTtd(bool reverse)
         logDebug("TTD {} run stopped at {:#x}:{:#x} after {} steps (watch {:#x})",
                  reverse ? "reverse" : "forward", after ? after->Major : 0, after ? after->Minor : 0,
                  result.stepCount, hit.pending ? hit.address : 0);
+    }
+    if (gTtdStopRequested)
+    {
+        gTtdMovementCondition.notify_all();
+        return true;
+    }
+    if (gTtdInterruptRequested.exchange(false))
+    {
+        queueCallback([]
+        {
+            gNextExecutionStatus = DEBUG_STATUS_BREAK;
+            EXCEPTION_DEBUG_INFO boundary = {};
+            boundary.dwFirstChance = TRUE;
+            boundary.ExceptionRecord.ExceptionCode = EXCEPTION_BREAKPOINT;
+            boundary.ExceptionRecord.ExceptionAddress = (PVOID)(ULONG_PTR)gTtdCursor->GetProgramCounter();
+            setFakeDebugEvent(boundary);
+            dispatchSystemBreakpoint(&boundary);
+            gTtdMovementCondition.notify_all();
+            return true;
+        });
+        gTtdMovementCondition.notify_all();
+        return true;
     }
     if (queueTtdWatchpointHit(hit))
     {
@@ -3685,6 +3715,8 @@ __declspec(dllexport) bool StopDebug()
             gTtdStopRequested = true;
         }
         gTtdMovementCondition.notify_all();
+        if (gIsDebugging && gTtdCursor)
+            gTtdCursor->InterruptReplay();
         if (!gIsDebugging)
         {
             gProcessInfo = {};
@@ -5519,7 +5551,27 @@ __declspec(dllexport) bool ProcessIsWow64(HANDLE hProcess, PBOOL isWow64)
 }
 
 __declspec(dllexport) bool TitanTerminateProcess(HANDLE hProcess, DWORD exitCode) { const auto h = registeredNativeHandle(hProcess, TitanHandleType::Process); return h && !!TerminateProcess(h, exitCode); }
-__declspec(dllexport) bool TitanDebugBreakProcess(HANDLE hProcess) { const auto h = registeredNativeHandle(hProcess, TitanHandleType::Process); return h && !!DebugBreakProcess(h); }
+__declspec(dllexport) bool TitanDebugBreakProcess(HANDLE hProcess)
+{
+    if (gSessionKind == UE_SESSION_TTD && gIsDebugging && gTtdCursor)
+    {
+        {
+            std::lock_guard lock(gMutexHandleRegistry);
+            const auto found = gHandleRegistry.find(hProcess);
+            if (found == gHandleRegistry.end() || found->second.type != TitanHandleType::Process ||
+                found->second.sessionGeneration != gSessionGeneration)
+            {
+                SetLastError(ERROR_INVALID_HANDLE);
+                return false;
+            }
+        }
+        gTtdInterruptRequested = true;
+        gTtdCursor->InterruptReplay();
+        return true;
+    }
+    const auto h = registeredNativeHandle(hProcess, TitanHandleType::Process);
+    return h && !!DebugBreakProcess(h);
+}
 __declspec(dllexport) HANDLE TitanCreateRemoteThread(HANDLE hProcess, LPTHREAD_START_ROUTINE start, LPVOID argument, DWORD creationFlags, LPDWORD threadId)
 {
     const auto process = registeredNativeHandle(hProcess, TitanHandleType::Process);
