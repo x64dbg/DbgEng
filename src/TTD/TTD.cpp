@@ -1,4 +1,5 @@
 #include <windows.h> 
+#include <algorithm>
 #include <stdio.h> 
 #include <iostream>
 #include <stdexcept>
@@ -94,17 +95,30 @@ namespace TTD {
 
 	bool Cursor::ReadMemory(GuestAddress address, void* dst, size_t size)
 	{
-		TBuffer buf;
-		buf.dst_buffer = dst;
-		buf.size = size;
+		return ReadMemoryPartial(address, dst, size) == size;
+	}
 
-		MemoryBuffer memorybuffer = {};
+	size_t Cursor::ReadMemoryPartial(GuestAddress address, void* dst, size_t size)
+	{
+		size_t total = 0;
+		while (total < size)
+		{
+			TBuffer buf;
+			buf.dst_buffer = static_cast<unsigned char*>(dst) + total;
+			buf.size = size - total;
+
+			MemoryBuffer memorybuffer = {};
 #ifdef _WIN64
-		this->cursor->ICursor->QueryMemoryBuffer(cursor, &memorybuffer, address, &buf, 0);
+			this->cursor->ICursor->QueryMemoryBuffer(cursor, &memorybuffer, address + total, &buf, 0);
 #else
-		memorybuffer = this->cursor->ICursor->QueryMemoryBuffer(cursor, address, buf, 0);
+			memorybuffer = this->cursor->ICursor->QueryMemoryBuffer(cursor, address + total, buf, 0);
 #endif
-		return memorybuffer.data != nullptr;
+			if (!memorybuffer.data || memorybuffer.addr != address + total || !memorybuffer.size)
+				break;
+			const auto chunk = (std::min)(size - total, static_cast<size_t>(memorybuffer.size));
+			total += chunk;
+		}
+		return total;
 	}
 
 	//The caller should free memorybuffer and memorybuffer->data (same value as buf->dst_buffer) after call QueryMemoryBuffer function

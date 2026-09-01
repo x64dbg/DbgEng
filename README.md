@@ -12,8 +12,11 @@ and common process/thread controls. It also supports immutable x64/x86
 user-minidump sessions with synthetic process/thread identities, captured
 memory maps, contexts, modules, threads, stored exceptions, and repeatable
 teardown. TTD `.run` sessions additionally support exact positions, forward
-and reverse execution, trace exceptions, timeline changes, and logical
-code/data breakpoints through the typed TTD replay engine. Event,
+and reverse execution, trace exceptions, timeline changes, logical code/data
+breakpoints, interruptible runs, and a non-destructive recorded-process-exit
+boundary through the typed TTD replay engine. Single-step filters stale
+current-position watchpoint notifications, and forward step cannot cross a
+published process-exit boundary into sparse raw post-exit state. Event,
 initialization, and explicitly opened process/thread handles
 are tracked in an authoritative ownership registry. Page-guard rearming
 suspends peer target threads during the hidden

@@ -300,6 +300,8 @@ static std::atomic_bool gTtdStopRequested = false;
 static std::atomic_bool gTtdInterruptRequested = false;
 static bool gTtdCursorChanged = false;
 static bool gTtdNextRunReverse = false;
+static bool gTtdHasProcessExitBoundary = false;
+static TTD::Position gTtdProcessExitBoundary = {};
 struct TtdWatchHit
 {
     bool pending = false;
@@ -475,6 +477,8 @@ static void resetTtdSession()
     gTtdInterruptRequested = false;
     gTtdCursorChanged = false;
     gTtdNextRunReverse = false;
+    gTtdHasProcessExitBoundary = false;
+    gTtdProcessExitBoundary = {};
     gTtdWatchHit = {};
 }
 
@@ -2389,12 +2393,12 @@ __declspec(dllexport) bool MemoryReadUnsafe(HANDLE hProcess, LPCVOID lpBaseAddre
             SetLastError(!gTtdCursor ? ERROR_INVALID_HANDLE : ERROR_INVALID_PARAMETER);
             return false;
         }
-        const auto result = gTtdCursor->ReadMemory((ULONG64)(ULONG_PTR)lpBaseAddress, lpBuffer, nSize);
+        const auto bytesRead = gTtdCursor->ReadMemoryPartial((ULONG64)(ULONG_PTR)lpBaseAddress, lpBuffer, nSize);
         if (lpNumberOfBytesRead)
-            *lpNumberOfBytesRead = result ? nSize : 0;
-        if (!result)
+            *lpNumberOfBytesRead = bytesRead;
+        if (bytesRead != nSize)
             SetLastError(ERROR_PARTIAL_COPY);
-        return result;
+        return bytesRead == nSize;
     }
 
     auto itr = gDebugIdMap.processHandleToIndex.find(hProcess);
@@ -2568,6 +2572,58 @@ __declspec(dllexport) SIZE_T MemoryQuerySafe(HANDLE hProcess, LPCVOID lpAddress,
                 lpBuffer->Protect = PAGE_EXECUTE_READ;
                 lpBuffer->Type = MEM_IMAGE;
                 return sizeof(*lpBuffer);
+            }
+        }
+
+        // TTD does not expose private allocations through the module list.
+        // Synthesize active TEB and stack ranges from each thread's NT_TIB so
+        // x64dbg's sequential memory-map walk can discover the stack at RSP.
+        const auto threadList = gTtdCursor->GetThreadList();
+        const auto threadCount = gTtdCursor->GetThreadCount();
+        for (size_t i = 0; threadList && i < threadCount; ++i)
+        {
+            const auto thread = threadList[i].info;
+            if (!thread)
+                continue;
+            const auto teb = gTtdCursor->GetTebAddress(thread->threadid);
+            ULONG_PTR tib[3] = {};
+            if (teb && gTtdCursor->ReadMemory(teb, tib, sizeof(tib)))
+            {
+                const auto stackBase = (ULONG64)tib[1];
+                const auto stackLimit = (ULONG64)tib[2];
+                if (stackLimit && stackBase > stackLimit)
+                {
+                    ranges.emplace_back(stackLimit, stackBase);
+                    if (address >= stackLimit && address < stackBase)
+                    {
+                        *lpBuffer = {};
+                        lpBuffer->BaseAddress = (PVOID)(ULONG_PTR)stackLimit;
+                        lpBuffer->AllocationBase = (PVOID)(ULONG_PTR)stackLimit;
+                        lpBuffer->AllocationProtect = PAGE_READWRITE;
+                        lpBuffer->RegionSize = (SIZE_T)(stackBase - stackLimit);
+                        lpBuffer->State = MEM_COMMIT;
+                        lpBuffer->Protect = PAGE_READWRITE;
+                        lpBuffer->Type = MEM_PRIVATE;
+                        return sizeof(*lpBuffer);
+                    }
+                }
+            }
+            if (teb)
+            {
+                const auto tebPage = (ULONG64)teb & ~0xFFFull;
+                ranges.emplace_back(tebPage, tebPage + 0x1000);
+                if (address >= tebPage && address < tebPage + 0x1000)
+                {
+                    *lpBuffer = {};
+                    lpBuffer->BaseAddress = (PVOID)(ULONG_PTR)tebPage;
+                    lpBuffer->AllocationBase = (PVOID)(ULONG_PTR)tebPage;
+                    lpBuffer->AllocationProtect = PAGE_READWRITE;
+                    lpBuffer->RegionSize = 0x1000;
+                    lpBuffer->State = MEM_COMMIT;
+                    lpBuffer->Protect = PAGE_READWRITE;
+                    lpBuffer->Type = MEM_PRIVATE;
+                    return sizeof(*lpBuffer);
+                }
             }
         }
 
@@ -3492,13 +3548,41 @@ __declspec(dllexport) bool ReplayStep(bool Reverse, bool StepOver, TITANCBSTEP S
     TtdWatchHit hit = {};
     {
         std::lock_guard lock(gMutexPaused);
-        gTtdWatchHit = {};
-        if (Reverse)
-            gTtdCursor->ReplayBackward(&result, &gTtdFirstPosition, 1);
-        else
-            gTtdCursor->ReplayForward(&result, &gTtdLastPosition, 1);
+        const auto before = gTtdCursor->GetPosition();
+        const TTD::Position beforePosition = before ? *before : TTD::Position {};
+        if (!Reverse && gTtdHasProcessExitBoundary && beforePosition == gTtdProcessExitBoundary)
+        {
+            SetLastError(ERROR_NO_MORE_ITEMS);
+            return false;
+        }
+        for (unsigned attempt = 0; attempt < 2; ++attempt)
+        {
+            result = {};
+            gTtdWatchHit = {};
+            if (Reverse)
+                gTtdCursor->ReplayBackward(&result, &gTtdFirstPosition, 1);
+            else
+                gTtdCursor->ReplayForward(&result, &gTtdLastPosition, 1);
+            if (result.stepCount || !gTtdWatchHit.pending)
+                break;
+
+            // TTD can re-report an execute watchpoint at the current cursor
+            // position as a zero-step hit. Ignore that stale notification and
+            // retry so a step away from a forward- or reverse-hit logical code
+            // breakpoint remains a single step instead of becoming a run.
+            if (gTtdWatchHit.sequence != beforePosition.Major || gTtdWatchHit.steps != beforePosition.Minor)
+            {
+                TTD::Position watchPosition { gTtdWatchHit.sequence, gTtdWatchHit.steps };
+                gTtdCursor->SetPositionOnThread(gTtdWatchHit.uniqueThreadId, &watchPosition);
+                result.stepCount = 1;
+                break;
+            }
+            logDebug("Ignoring a stale TTD watchpoint notification while stepping at {:#x}:{:#x}",
+                     beforePosition.Major, beforePosition.Minor);
+        }
         if (!result.stepCount || !updateTtdCursorIdentity())
         {
+            gTtdWatchHit = {};
             SetLastError(ERROR_NO_MORE_ITEMS);
             return false;
         }
@@ -3621,6 +3705,31 @@ static bool runTtd(bool reverse)
                     result.stepCount = 1;
             }
         }
+        const auto terminalPosition = gTtdCursor->GetPosition();
+        exceptionEventHit = exceptionEventHit && terminalPosition &&
+                            terminalPosition->Major == exceptionEvent.pos.Major &&
+                            terminalPosition->Minor == exceptionEvent.pos.Minor;
+        if (!reverse && result.stepCount && !gTtdWatchHit.pending && !exceptionEventHit &&
+            !gTtdStopRequested && !gTtdInterruptRequested)
+        {
+            // ReplayForward stops at the process-exit event, where TTD exposes
+            // only a sparse post-exit stack. Park one instruction earlier so
+            // the non-destructive exit boundary retains the final full context.
+            TTD::TTD_Replay_ICursorView_ReplayResult parkResult = {};
+            gTtdWatchHit = {};
+            gTtdCursor->ReplayBackward(&parkResult, &gTtdFirstPosition, 1);
+            if (parkResult.stepCount)
+            {
+                const auto boundary = gTtdCursor->GetPosition();
+                if (boundary)
+                {
+                    gTtdProcessExitBoundary = *boundary;
+                    gTtdHasProcessExitBoundary = true;
+                }
+                logDebug("Parked TTD cursor at the final executable position before process exit");
+            }
+            gTtdWatchHit = {};
+        }
         gPaused = true;
         if (!updateTtdCursorIdentity())
             return false;
@@ -3628,8 +3737,6 @@ static bool runTtd(bool reverse)
         gTtdWatchHit = {};
         refreshTtdTimeline();
         const auto after = gTtdCursor->GetPosition();
-        exceptionEventHit = exceptionEventHit && after && after->Major == exceptionEvent.pos.Major &&
-                            after->Minor == exceptionEvent.pos.Minor;
         logDebug("TTD {} run stopped at {:#x}:{:#x} after {} steps (watch {:#x})",
                  reverse ? "reverse" : "forward", after ? after->Major : 0, after ? after->Minor : 0,
                  result.stepCount, hit.pending ? hit.address : 0);
@@ -3643,7 +3750,6 @@ static bool runTtd(bool reverse)
     {
         queueCallback([]
         {
-            gNextExecutionStatus = DEBUG_STATUS_BREAK;
             EXCEPTION_DEBUG_INFO boundary = {};
             boundary.dwFirstChance = TRUE;
             boundary.ExceptionRecord.ExceptionCode = EXCEPTION_BREAKPOINT;
@@ -3678,26 +3784,19 @@ static bool runTtd(bool reverse)
 
     queueCallback([reverse]
     {
-        gNextExecutionStatus = DEBUG_STATUS_BREAK;
-        if (reverse)
+        constexpr ULONG_PTR replayExitMarker = 0x54545845u; // "TTXE"
+        EXCEPTION_DEBUG_INFO boundary = {};
+        boundary.dwFirstChance = TRUE;
+        boundary.ExceptionRecord.ExceptionCode = EXCEPTION_BREAKPOINT;
+        boundary.ExceptionRecord.ExceptionAddress = (PVOID)(ULONG_PTR)gTtdCursor->GetProgramCounter();
+        if (!reverse)
         {
-            EXCEPTION_DEBUG_INFO boundary = {};
-            boundary.dwFirstChance = TRUE;
-            boundary.ExceptionRecord.ExceptionCode = EXCEPTION_BREAKPOINT;
-            boundary.ExceptionRecord.ExceptionAddress = (PVOID)(ULONG_PTR)gTtdCursor->GetProgramCounter();
-            setFakeDebugEvent(boundary);
-            dispatchSystemBreakpoint(&boundary);
+            boundary.ExceptionRecord.NumberParameters = 1;
+            boundary.ExceptionRecord.ExceptionInformation[0] = replayExitMarker;
+            logDebug("Replay reached the recorded process exit; the session remains paused");
         }
-        else
-        {
-            EXIT_PROCESS_DEBUG_INFO info = {};
-            setFakeDebugEvent(info);
-            dispatchDebugEvent(UE_CH_EXITPROCESS, &info);
-            {
-                std::lock_guard lock(gTtdMovementMutex);
-                gTtdStopRequested = true;
-            }
-        }
+        setFakeDebugEvent(boundary);
+        dispatchSystemBreakpoint(&boundary);
         gTtdMovementCondition.notify_all();
         return true;
     });
