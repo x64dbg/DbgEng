@@ -14,7 +14,11 @@ memory maps, contexts, modules, threads, stored exceptions, and repeatable
 teardown. TTD `.run` sessions additionally support exact positions, forward
 and reverse execution, trace exceptions, timeline changes, logical code/data
 breakpoints, interruptible runs, and a non-destructive recorded-process-exit
-boundary through the typed TTD replay engine. Single-step filters stale
+boundary through the typed TTD replay engine. TTD step-over is implemented
+behind the ordinary TitanEngine `StepOver` export: the adapter discovers a
+recorded call's return address and owns a current-thread temporary watchpoint,
+so peer-thread executions are ignored without a replay-specific public
+breakpoint flag. Single-step filters stale
 current-position watchpoint notifications, and forward step cannot cross a
 published process-exit boundary into sparse raw post-exit state. Event,
 initialization, and explicitly opened process/thread handles

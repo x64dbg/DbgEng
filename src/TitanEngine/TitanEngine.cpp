@@ -234,6 +234,7 @@ struct BreakpointInfo
     DWORD hardwareRegister = 0;
     bool nativePatch = false;
     bool oneShot = false;
+    ULONG ttdThreadAffinity = 0;
     BYTE patchSize = 0;
     BYTE originalBytes[2] = {};
     BYTE patchBytes[2] = {};
@@ -314,6 +315,12 @@ struct TtdWatchHit
     DWORD threadId = 0;
 };
 static TtdWatchHit gTtdWatchHit;
+struct TtdStepOverProbe
+{
+    ULONG uniqueThreadId = 0;
+    ULONG64 returnAddress = 0;
+};
+static TtdStepOverProbe* gTtdStepOverProbe = nullptr;
 
 /* DbgEng interfaces:
 #define INTERFACE IDebugAdvanced4
@@ -480,6 +487,7 @@ static void resetTtdSession()
     gTtdHasProcessExitBoundary = false;
     gTtdProcessExitBoundary = {};
     gTtdWatchHit = {};
+    gTtdStepOverProbe = nullptr;
 }
 
 static DWORD debugProcessId()
@@ -2838,6 +2846,26 @@ __declspec(dllexport) PROCESS_INFORMATION* InitDebugW(const wchar_t* szFileName,
     return &gProcessInfo;
 }
 
+static bool ttdMemoryBreakpointMatches(const MemoryBreakpointInfo& breakpoint, ULONG64 address, ULONG64 flags)
+{
+    if (address < breakpoint.start || address - breakpoint.start >= breakpoint.size)
+        return false;
+    return breakpoint.type == UE_MEMORY ||
+           (breakpoint.type == UE_MEMORY_READ && flags == MEM_READ_EVENT_FLAG) ||
+           (breakpoint.type == UE_MEMORY_WRITE && flags == MEM_WRITE_EVENT_FLAG) ||
+           (breakpoint.type == UE_MEMORY_EXECUTE && flags > MEM_WRITE_EVENT_FLAG);
+}
+
+static void __fastcall ttdCallReturnCallback(TTD::CallbackValue, TTD::GuestAddress, TTD::GuestAddress returnAddress,
+                                              TTD::TTD_Replay_IThreadView* threadView)
+{
+    if (!gTtdStepOverProbe || !returnAddress || !threadView || !threadView->IThreadView)
+        return;
+    const auto thread = threadView->IThreadView->GetThreadInfo(threadView);
+    if (thread && thread->unk1 == gTtdStepOverProbe->uniqueThreadId)
+        gTtdStepOverProbe->returnAddress = returnAddress;
+}
+
 static bool __fastcall ttdMemoryWatchpointCallback(TTD::CallbackValue, const TTD::TTD_Replay_MemoryWatchpointResult* result,
                                                     TTD::TTD_Replay_IThreadView* threadView)
 {
@@ -2845,14 +2873,60 @@ static bool __fastcall ttdMemoryWatchpointCallback(TTD::CallbackValue, const TTD
         return false;
     const auto thread = threadView->IThreadView->GetThreadInfo(threadView);
     const auto position = threadView->IThreadView->GetPosition(threadView);
+    const auto uniqueThreadId = thread ? thread->unk1 : 0;
+
+    // TTD watchpoints are cursor-global. A thread-affine temporary step-over
+    // breakpoint must let matching executions in peer threads pass without
+    // stopping replay; ordinary user code/data breakpoints remain global.
+    bool registeredWatchpoint = false;
+    bool acceptedWatchpoint = false;
+    for (const auto& [id, breakpoint] : gBreakpoints)
+    {
+        if (breakpoint.kind != BreakpointKind::Software || breakpoint.offset != result->addr)
+            continue;
+        registeredWatchpoint = true;
+        if (!breakpoint.ttdThreadAffinity || breakpoint.ttdThreadAffinity == uniqueThreadId)
+            acceptedWatchpoint = true;
+    }
+    for (const auto& [id, breakpoint] : gMemoryBreakpoints)
+    {
+        if (!ttdMemoryBreakpointMatches(breakpoint, result->addr, result->flags))
+            continue;
+        registeredWatchpoint = true;
+        acceptedWatchpoint = true;
+    }
+    if (!registeredWatchpoint || !acceptedWatchpoint)
+        return false;
+
     gTtdWatchHit.pending = true;
     gTtdWatchHit.address = result->addr;
     gTtdWatchHit.size = result->size;
     gTtdWatchHit.flags = result->flags;
     gTtdWatchHit.sequence = position ? position->Major : 0;
     gTtdWatchHit.steps = position ? position->Minor : 0;
-    gTtdWatchHit.uniqueThreadId = thread ? thread->unk1 : 0;
+    gTtdWatchHit.uniqueThreadId = uniqueThreadId;
     gTtdWatchHit.threadId = thread ? thread->threadid : 0;
+    return true;
+}
+
+// The caller holds gMutexPaused and has already checked for an existing
+// software breakpoint at this address.
+static bool addTtdSoftwareBreakpoint(ULONG_PTR address, TITANCBSOFTBP callback, bool oneShot, ULONG threadAffinity)
+{
+    TTD::TTD_Replay_MemoryWatchpointData watchpoint { address, 1, TTD::BP_FLAGS::EXEC };
+    if (!gTtdCursor || !gTtdCursor->AddMemoryWatchpoint(&watchpoint))
+    {
+        SetLastError(ERROR_GEN_FAILURE);
+        return false;
+    }
+    BreakpointInfo info;
+    info.id = gNextNativeBreakpointId++;
+    info.kind = BreakpointKind::Software;
+    info.callback = callback;
+    info.offset = address;
+    info.oneShot = oneShot;
+    info.ttdThreadAffinity = threadAffinity;
+    gBreakpoints.emplace(info.id, info);
     return true;
 }
 
@@ -3372,7 +3446,8 @@ static bool queueTtdWatchpointHit(const TtdWatchHit& hit)
 
     for (const auto& [id, breakpoint] : gBreakpoints)
     {
-        if (breakpoint.kind != BreakpointKind::Software || breakpoint.offset != hit.address)
+        if (breakpoint.kind != BreakpointKind::Software || breakpoint.offset != hit.address ||
+            (breakpoint.ttdThreadAffinity && breakpoint.ttdThreadAffinity != hit.uniqueThreadId))
             continue;
         const auto callback = breakpoint.callback;
         const auto oneShot = breakpoint.oneShot;
@@ -3401,13 +3476,7 @@ static bool queueTtdWatchpointHit(const TtdWatchHit& hit)
 
     for (const auto& [id, breakpoint] : gMemoryBreakpoints)
     {
-        if (hit.address < breakpoint.start || hit.address - breakpoint.start >= breakpoint.size)
-            continue;
-        const auto accessMatches = breakpoint.type == UE_MEMORY ||
-                                   (breakpoint.type == UE_MEMORY_READ && hit.flags == MEM_READ_EVENT_FLAG) ||
-                                   (breakpoint.type == UE_MEMORY_WRITE && hit.flags == MEM_WRITE_EVENT_FLAG) ||
-                                   (breakpoint.type == UE_MEMORY_EXECUTE && hit.flags > MEM_WRITE_EVENT_FLAG);
-        if (!accessMatches)
+        if (!ttdMemoryBreakpointMatches(breakpoint, hit.address, hit.flags))
             continue;
         const auto callback = breakpoint.callback;
         if (!breakpoint.restoreOnHit)
@@ -3533,7 +3602,7 @@ __declspec(dllexport) bool ReplayStep(bool Reverse, bool StepOver, TITANCBSTEP S
         SetLastError(ERROR_NOT_SUPPORTED);
         return false;
     }
-    if (StepOver)
+    if (Reverse && StepOver)
     {
         SetLastError(ERROR_NOT_SUPPORTED);
         return false;
@@ -3546,6 +3615,7 @@ __declspec(dllexport) bool ReplayStep(bool Reverse, bool StepOver, TITANCBSTEP S
 
     TTD::TTD_Replay_ICursorView_ReplayResult result = {};
     TtdWatchHit hit = {};
+    bool continueStepOver = false;
     {
         std::lock_guard lock(gMutexPaused);
         const auto before = gTtdCursor->GetPosition();
@@ -3555,6 +3625,23 @@ __declspec(dllexport) bool ReplayStep(bool Reverse, bool StepOver, TITANCBSTEP S
             SetLastError(ERROR_NO_MORE_ITEMS);
             return false;
         }
+
+        TtdStepOverProbe stepOverProbe;
+        if (StepOver)
+        {
+            const auto thread = gTtdCursor->GetThreadInfo();
+            if (!thread)
+            {
+                SetLastError(ERROR_INVALID_DATA);
+                return false;
+            }
+            stepOverProbe.uniqueThreadId = thread->unk1;
+            gTtdStepOverProbe = &stepOverProbe;
+            logDebug("Probing TTD step-over on unique thread {} at {:#x}:{:#x}",
+                     stepOverProbe.uniqueThreadId, beforePosition.Major, beforePosition.Minor);
+            gTtdCursor->SetCallReturnCallback(ttdCallReturnCallback, 0);
+        }
+
         for (unsigned attempt = 0; attempt < 2; ++attempt)
         {
             result = {};
@@ -3580,16 +3667,50 @@ __declspec(dllexport) bool ReplayStep(bool Reverse, bool StepOver, TITANCBSTEP S
             logDebug("Ignoring a stale TTD watchpoint notification while stepping at {:#x}:{:#x}",
                      beforePosition.Major, beforePosition.Minor);
         }
+        if (StepOver)
+        {
+            gTtdCursor->SetCallReturnCallback(nullptr, 0);
+            gTtdStepOverProbe = nullptr;
+            logDebug("TTD step-over probe moved {} instruction(s), return address {:#x}",
+                     result.stepCount, stepOverProbe.returnAddress);
+        }
         if (!result.stepCount || !updateTtdCursorIdentity())
         {
             gTtdWatchHit = {};
             SetLastError(ERROR_NO_MORE_ITEMS);
             return false;
         }
+
+        // A single recorded instruction is sufficient for ordinary and REP
+        // instructions. If the instruction was a call on the selected thread,
+        // continue to its recorded return address using an engine-owned,
+        // current-thread one-shot watchpoint. No replay policy leaks into
+        // x64dbg's command layer or the public TitanEngine breakpoint flags.
+        if (StepOver && stepOverProbe.returnAddress && !gTtdWatchHit.pending)
+        {
+            const auto existing = std::find_if(gBreakpoints.begin(), gBreakpoints.end(), [&](const auto& entry)
+            {
+                return entry.second.kind == BreakpointKind::Software &&
+                       entry.second.offset == stepOverProbe.returnAddress;
+            });
+            if (existing == gBreakpoints.end() &&
+                !addTtdSoftwareBreakpoint((ULONG_PTR)stepOverProbe.returnAddress, StepCallBack, true,
+                                           stepOverProbe.uniqueThreadId))
+            {
+                gTtdWatchHit = {};
+                return false;
+            }
+            gTtdNextRunReverse = false;
+            continueStepOver = true;
+        }
+
         hit = gTtdWatchHit;
         gTtdWatchHit = {};
         refreshTtdTimeline();
     }
+    if (continueStepOver)
+        return true;
+
     const auto breakpointHit = queueTtdWatchpointHit(hit);
     if (StepCallBack && !breakpointHit)
     {
@@ -3913,22 +4034,7 @@ __declspec(dllexport) bool SetBPX(ULONG_PTR bpxAddress, DWORD bpxType /* TitanSo
     }
 
     if (gSessionKind == UE_SESSION_TTD)
-    {
-        TTD::TTD_Replay_MemoryWatchpointData watchpoint { bpxAddress, 1, TTD::BP_FLAGS::EXEC };
-        if (!gTtdCursor || !gTtdCursor->AddMemoryWatchpoint(&watchpoint))
-        {
-            SetLastError(ERROR_GEN_FAILURE);
-            return false;
-        }
-        BreakpointInfo info;
-        info.id = gNextNativeBreakpointId++;
-        info.kind = BreakpointKind::Software;
-        info.callback = bpxCallBack;
-        info.offset = bpxAddress;
-        info.oneShot = (bpxType & UE_SINGLESHOOT) != 0;
-        gBreakpoints.emplace(info.id, info);
-        return true;
-    }
+        return addTtdSoftwareBreakpoint(bpxAddress, bpxCallBack, (bpxType & UE_SINGLESHOOT) != 0, 0);
 
     TitanBreakpointType selectedType = gDefaultBreakpointType;
     switch (bpxType & 0xF0000000)
@@ -4820,7 +4926,25 @@ __declspec(dllexport) void StepOver(TITANCBSTEP traceCallBack)
 {
     if (gSessionKind == UE_SESSION_TTD)
     {
-        ReplayStep(false, true, traceCallBack);
+        if (!ReplayStep(false, true, traceCallBack))
+        {
+            const auto error = GetLastError();
+            logError("Unable to schedule TTD step-over: {:#x}", error);
+            if (traceCallBack)
+            {
+                queueCallback([traceCallBack]
+                {
+                    gFakeDebugEvent.dwProcessId = debugProcessId();
+                    gFakeDebugEvent.dwThreadId = debugThreadId();
+                    beginDebugEvent(false);
+                    traceCallBack();
+                    finishDebugEvent(false);
+                    return true;
+                });
+                gTtdMovementCondition.notify_all();
+            }
+            SetLastError(error);
+        }
         return;
     }
     debugStep(DEBUG_STATUS_STEP_OVER, traceCallBack);

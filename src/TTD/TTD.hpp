@@ -205,7 +205,7 @@ namespace TTD {
 		void* unk44;
 		//  void (__fastcall *_SetFallbackCallback_Cursor_Replay_TTD__UEAAXQ6AX_K_NW4GuestAddress_Nirvana__0PEBVIThreadView_23__Z_K_Z)(TTD::Replay::Cursor *__hidden this, void (__stdcall __high *const)(unsigned __int64, bool, enum Nirvana::GuestAddress, unsigned __int64, const struct TTD::Replay::IThreadView *), unsigned __int64);
 		void* unk45;
-		void(__thiscall* SetCallReturnCallback)(TTD_Replay_ICursor* self, void(__stdcall* const)(unsigned __int64 callback_value, GuestAddress addr_func, GuestAddress addr_ret, struct TTD_Replay_IThreadView* thread_info), unsigned __int64 callback_value);
+		void(__thiscall* SetCallReturnCallback)(TTD_Replay_ICursor* self, void(__fastcall* const)(CallbackValue callback_value, GuestAddress addr_func, GuestAddress addr_ret, struct TTD_Replay_IThreadView* thread_info), CallbackValue callback_value);
 		//  void (__fastcall *_SetIndirectJumpCallback_Cursor_Replay_TTD__UEAAXQ6AX_KW4GuestAddress_Nirvana__PEBVIThreadView_23__Z_K_Z)(TTD::Replay::Cursor *__hidden this, void (__stdcall __high *const)(unsigned __int64, enum Nirvana::GuestAddress, const struct TTD::Replay::IThreadView *), unsigned __int64);
 		void* unk47;
 		//  void (__fastcall *_SetRegisterChangedCallback_Cursor_Replay_TTD__UEAAXQ6AX_KEPEBX10PEBVIThreadView_23__Z_K_Z)(TTD::Replay::Cursor *__hidden this, void (__stdcall *const)(unsigned __int64, unsigned __int8, const void *, const void *, unsigned __int64, const struct TTD::Replay::IThreadView *), unsigned __int64);
@@ -421,7 +421,10 @@ namespace TTD {
 
 	typedef unsigned int(__cdecl* PROC_Initiate)(const char* seed, BYTE* b64rand_out);
 	typedef unsigned int(__cdecl* PROC_Create)(const char* handshake, void* ReplayEngine_out, BYTE* guid_version);
-	typedef void(__stdcall* const PROC_CallCallback)(unsigned __int64 callback_value, GuestAddress addr_func, GuestAddress addr_ret, struct TTD_Replay_IThreadView* thread_info);
+	// The x86 runtime uses the ContextBoundCallback fastcall ABI and a
+	// pointer-sized callback value; using the x64-sized/stdcall declaration
+	// corrupts the stack when the first recorded call invokes the callback.
+	typedef void(__fastcall* const PROC_CallCallback)(CallbackValue callback_value, GuestAddress addr_func, GuestAddress addr_ret, struct TTD_Replay_IThreadView* thread_info);
 	/*!
 	 * \brief	Callback called on MemoryWatchpoint hit, with hit information
 	 *			Return TRUE to stop execution, FALSE to continue
@@ -505,7 +508,7 @@ namespace TTD {
 		struct TTD_Replay_ICursorView_ReplayResult* ReplayForward(struct TTD_Replay_ICursorView_ReplayResult* replay_result_out, struct Position* posMax, unsigned __int64 stepCount);
 		struct TTD_Replay_ICursorView_ReplayResult* ReplayBackward(struct TTD_Replay_ICursorView_ReplayResult* replay_result_out, struct Position* posMin, unsigned __int64 stepCount);
 		void InterruptReplay();
-		void SetCallReturnCallback(PROC_CallCallback callCallback, unsigned __int64 callback_value);
+		void SetCallReturnCallback(PROC_CallCallback callCallback, CallbackValue callback_value);
 		void SetMemoryWatchpointCallback(PROC_MemCallback memCallback, CallbackValue callback_value);
 		bool AddMemoryWatchpoint(TTD_Replay_MemoryWatchpointData* data);
 		bool RemoveMemoryWatchpoint(TTD_Replay_MemoryWatchpointData* data);
