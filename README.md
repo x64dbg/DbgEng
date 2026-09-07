@@ -13,8 +13,14 @@ user-minidump sessions with synthetic process/thread identities, captured
 memory maps, contexts, modules, threads, stored exceptions, and repeatable
 teardown. TTD `.run` sessions additionally support exact positions, forward
 and reverse execution, trace exceptions, timeline changes, logical code/data
-breakpoints, interruptible runs, and a non-destructive recorded-process-exit
-boundary through the typed TTD replay engine. TTD step-over is implemented
+breakpoints, interruptible runs, and a navigable recorded-process-exit event
+through the ordinary `EXIT_PROCESS` callback. `RequestPause` maps live sessions
+to DbgEng's native interrupt and TTD sessions to cursor interruption; callers
+observe the same pause callback without selecting either mechanism. Forward
+run, step-into, and step-over use the ordinary TitanEngine exports; any x86
+WOW64 transition workaround is owned by `StepInto` and controlled through the
+engine option rather than a session capability. The replay-specific execution
+ABI contains only `ReplayRunBack` and `ReplayStepBack`. TTD step-over is implemented
 behind the ordinary TitanEngine `StepOver` export: the adapter discovers a
 recorded call's return address and owns a current-thread temporary watchpoint,
 so peer-thread executions are ignored without a replay-specific public

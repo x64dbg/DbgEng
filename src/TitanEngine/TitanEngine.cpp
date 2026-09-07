@@ -257,7 +257,9 @@ struct MemoryBreakpointPage
 };
 
 static PROCESS_INFORMATION gProcessInfo;
-static std::map<TitanEngineVariable, bool> gEngineVariables;
+static std::map<TitanEngineVariable, bool> gEngineVariables = {
+    { UE_ENGINE_WOW64_SINGLE_STEP_WORKAROUND, true },
+};
 static TitanBreakpointType gDefaultBreakpointType = UE_BREAKPOINT_INT3;
 static std::map<TitanCustomHandler, TITANCALLBACKARG> gCustomHandlers;
 static DEBUG_EVENT gFakeDebugEvent;
@@ -366,6 +368,7 @@ static ULONG gNextExecutionStatus = DEBUG_STATUS_NO_CHANGE;
 static std::atomic<DWORD> gNextContinueStatus = DBG_CONTINUE;
 static bool gExpectSystemBreakpoint = false;
 static TITANCALLBACK gAttachCallback = nullptr;
+static std::atomic<TITANCBPAUSE> gPauseCallback = nullptr;
 
 static bool IsDebugThread()
 {
@@ -471,6 +474,7 @@ static void dispatchSystemBreakpoint(const void* argument)
 
 static void resetTtdSession()
 {
+    gPauseCallback = nullptr;
     gTtdCursor.reset();
     gTtdEngine.reset();
     gTtdFirstPosition = {};
@@ -3316,7 +3320,8 @@ __declspec(dllexport) bool GetSessionInfo(TITAN_SESSION_INFO* SessionInfo)
                                     UE_SESSION_CAP_CONTEXT_READ | UE_SESSION_CAP_FORWARD_EXECUTION |
                                     UE_SESSION_CAP_MEMORY_WRITE | UE_SESSION_CAP_CONTEXT_WRITE |
                                     UE_SESSION_CAP_PROCESS_CONTROL | UE_SESSION_CAP_THREAD_CONTROL |
-                                    UE_SESSION_CAP_NATIVE_HANDLES | UE_SESSION_CAP_EXCEPTION_CONTINUE;
+                                    UE_SESSION_CAP_NATIVE_HANDLES | UE_SESSION_CAP_EXCEPTION_CONTINUE |
+                                    UE_SESSION_CAP_PAUSE_EXECUTION;
     }
     else if (SessionInfo->kind == UE_SESSION_MINIDUMP)
     {
@@ -3329,7 +3334,8 @@ __declspec(dllexport) bool GetSessionInfo(TITAN_SESSION_INFO* SessionInfo)
                                     UE_SESSION_CAP_CONTEXT_READ | UE_SESSION_CAP_FORWARD_EXECUTION |
                                     UE_SESSION_CAP_REVERSE_EXECUTION | UE_SESSION_CAP_EXACT_POSITION |
                                     UE_SESSION_CAP_LOGICAL_CODE_BREAKPOINT | UE_SESSION_CAP_LOGICAL_DATA_BREAKPOINT |
-                                    UE_SESSION_CAP_TIMELINE_STATE;
+                                    UE_SESSION_CAP_TIMELINE_STATE | UE_SESSION_CAP_PAUSE_EXECUTION |
+                                    UE_SESSION_CAP_NAVIGABLE_PROCESS_EXIT;
     }
 
 #ifdef _WIN64
@@ -3579,7 +3585,7 @@ __declspec(dllexport) bool ReplaySetPosition(const TITAN_REPLAY_POSITION* Positi
     return true;
 }
 
-__declspec(dllexport) bool ReplayRun(bool Reverse)
+__declspec(dllexport) bool ReplayRunBack()
 {
     if (gSessionKind != UE_SESSION_TTD || !gTtdCursor)
     {
@@ -3591,11 +3597,11 @@ __declspec(dllexport) bool ReplayRun(bool Reverse)
         SetLastError(ERROR_BUSY);
         return false;
     }
-    gTtdNextRunReverse = Reverse;
+    gTtdNextRunReverse = true;
     return true;
 }
 
-__declspec(dllexport) bool ReplayStep(bool Reverse, bool StepOver, TITANCBSTEP StepCallBack)
+static bool replayStep(bool Reverse, bool StepOver, TITANCBSTEP StepCallBack)
 {
     if (gSessionKind != UE_SESSION_TTD || !gTtdCursor)
     {
@@ -3727,6 +3733,11 @@ __declspec(dllexport) bool ReplayStep(bool Reverse, bool StepOver, TITANCBSTEP S
     if (breakpointHit || StepCallBack)
         gTtdMovementCondition.notify_all();
     return true;
+}
+
+__declspec(dllexport) bool ReplayStepBack(TITANCBSTEP StepCallBack)
+{
+    return replayStep(true, false, StepCallBack);
 }
 
 static bool runTtd(bool reverse)
@@ -3869,14 +3880,22 @@ static bool runTtd(bool reverse)
     }
     if (gTtdInterruptRequested.exchange(false))
     {
-        queueCallback([]
+        const auto pauseCallback = gPauseCallback.exchange(nullptr);
+        queueCallback([pauseCallback]
         {
             EXCEPTION_DEBUG_INFO boundary = {};
             boundary.dwFirstChance = TRUE;
             boundary.ExceptionRecord.ExceptionCode = EXCEPTION_BREAKPOINT;
             boundary.ExceptionRecord.ExceptionAddress = (PVOID)(ULONG_PTR)gTtdCursor->GetProgramCounter();
             setFakeDebugEvent(boundary);
-            dispatchSystemBreakpoint(&boundary);
+            if (pauseCallback)
+            {
+                beginDebugEvent(false);
+                pauseCallback();
+                finishDebugEvent(false);
+            }
+            else
+                dispatchSystemBreakpoint(&boundary);
             gTtdMovementCondition.notify_all();
             return true;
         });
@@ -3903,24 +3922,32 @@ static bool runTtd(bool reverse)
         return true;
     }
 
-    queueCallback([reverse]
+    if (!reverse)
     {
-        constexpr ULONG_PTR replayExitMarker = 0x54545845u; // "TTXE"
-        EXCEPTION_DEBUG_INFO boundary = {};
-        boundary.dwFirstChance = TRUE;
-        boundary.ExceptionRecord.ExceptionCode = EXCEPTION_BREAKPOINT;
-        boundary.ExceptionRecord.ExceptionAddress = (PVOID)(ULONG_PTR)gTtdCursor->GetProgramCounter();
-        if (!reverse)
+        queueCallback([]
         {
-            boundary.ExceptionRecord.NumberParameters = 1;
-            boundary.ExceptionRecord.ExceptionInformation[0] = replayExitMarker;
+            EXIT_PROCESS_DEBUG_INFO exit = {};
+            setFakeDebugEvent(exit);
             logDebug("Replay reached the recorded process exit; the session remains paused");
-        }
-        setFakeDebugEvent(boundary);
-        dispatchSystemBreakpoint(&boundary);
-        gTtdMovementCondition.notify_all();
-        return true;
-    });
+            dispatchDebugEvent(UE_CH_EXITPROCESS, &exit);
+            gTtdMovementCondition.notify_all();
+            return true;
+        });
+    }
+    else
+    {
+        queueCallback([]
+        {
+            EXCEPTION_DEBUG_INFO boundary = {};
+            boundary.dwFirstChance = TRUE;
+            boundary.ExceptionRecord.ExceptionCode = EXCEPTION_BREAKPOINT;
+            boundary.ExceptionRecord.ExceptionAddress = (PVOID)(ULONG_PTR)gTtdCursor->GetProgramCounter();
+            setFakeDebugEvent(boundary);
+            dispatchSystemBreakpoint(&boundary);
+            gTtdMovementCondition.notify_all();
+            return true;
+        });
+    }
     gTtdMovementCondition.notify_all();
     return result.stepCount != 0;
 }
@@ -4912,21 +4939,73 @@ static void debugStep(ULONG status, TITANCBSTEP callback)
     gStepStatuses.emplace(threadIndex, status);
 }
 
+static bool scheduleWow64TransitionStep(TITANCBSTEP callback)
+{
+#ifndef _WIN64
+    if (gSessionKind != UE_SESSION_LIVE ||
+        !gEngineVariables[UE_ENGINE_WOW64_SINGLE_STEP_WORKAROUND])
+        return false;
+
+    ULONG threadIndex = 0;
+    if (FAILED(gDebugSystemObjects->GetCurrentThreadId(&threadIndex)))
+        return false;
+    const auto thread = gDebugIdMap.threadIndexToHandle.find(threadIndex);
+    const auto process = activeProcessHandle();
+    if (thread == gDebugIdMap.threadIndexToHandle.end() || !process)
+        return false;
+
+    unsigned char data[7] = {};
+    SIZE_T transferred = 0;
+    const auto cip = GetContextDataEx(thread->second, UE_CIP);
+    if (!MemoryReadSafe(process, (LPVOID)cip, data, sizeof(data), &transferred) ||
+        transferred != sizeof(data) || data[0] != 0xEA || data[5] != 0x33 || data[6] != 0x00)
+        return false;
+
+    ULONG_PTR returnAddress = 0;
+    const auto csp = GetContextDataEx(thread->second, UE_CSP);
+    transferred = 0;
+    return MemoryReadSafe(process, (LPVOID)csp, &returnAddress, sizeof(returnAddress), &transferred) &&
+           transferred == sizeof(returnAddress) &&
+           SetBPX(returnAddress, UE_SINGLESHOOT, callback);
+#else
+    return false;
+#endif
+}
+
 __declspec(dllexport) void StepInto(TITANCBSTEP traceCallBack)
 {
     if (gSessionKind == UE_SESSION_TTD)
     {
-        ReplayStep(false, false, traceCallBack);
+        if (!replayStep(false, false, traceCallBack))
+        {
+            const auto error = GetLastError();
+            logError("Unable to schedule TTD step-into: {:#x}", error);
+            if (traceCallBack)
+            {
+                queueCallback([traceCallBack]
+                {
+                    gFakeDebugEvent.dwProcessId = debugProcessId();
+                    gFakeDebugEvent.dwThreadId = debugThreadId();
+                    beginDebugEvent(false);
+                    traceCallBack();
+                    finishDebugEvent(false);
+                    return true;
+                });
+                gTtdMovementCondition.notify_all();
+            }
+            SetLastError(error);
+        }
         return;
     }
-    debugStep(DEBUG_STATUS_STEP_INTO, traceCallBack);
+    if (!scheduleWow64TransitionStep(traceCallBack))
+        debugStep(DEBUG_STATUS_STEP_INTO, traceCallBack);
 }
 
 __declspec(dllexport) void StepOver(TITANCBSTEP traceCallBack)
 {
     if (gSessionKind == UE_SESSION_TTD)
     {
-        if (!ReplayStep(false, true, traceCallBack))
+        if (!replayStep(false, true, traceCallBack))
         {
             const auto error = GetLastError();
             logError("Unable to schedule TTD step-over: {:#x}", error);
@@ -5344,6 +5423,23 @@ __declspec(dllexport) void DebugLoop()
                 std::lock_guard lgQueue(gMutexCallbackQueue);
                 hasEventCallback = !gCallbackQueue.empty();
             }
+            if (!hasEventCallback && gPauseCallback.load())
+            {
+                const auto callback = gPauseCallback.exchange(nullptr);
+                if (callback)
+                {
+                    queueCallback([callback]
+                    {
+                        gFakeDebugEvent.dwProcessId = debugProcessId();
+                        gFakeDebugEvent.dwThreadId = debugThreadId();
+                        beginDebugEvent(false);
+                        callback();
+                        finishDebugEvent(false);
+                        return true;
+                    });
+                    hasEventCallback = true;
+                }
+            }
             if (!hasEventCallback && (!gStepCallbacks.empty() || !gInternalStepCallbacks.empty()))
             {
                 ULONG threadIndex = 0;
@@ -5474,6 +5570,7 @@ __declspec(dllexport) void DebugLoop()
     gStepStatuses = {};
     gRetiredBreakpointAddresses = {};
     gAttachCallback = nullptr;
+    gPauseCallback = nullptr;
     gSessionKind = UE_SESSION_NONE;
 }
 
@@ -5503,6 +5600,7 @@ __declspec(dllexport) bool AttachDebugger(DWORD ProcessId, bool KillOnExit, LPVO
     gDebugThreadId = GetCurrentThreadId();
     gExpectSystemBreakpoint = true;
     gAttachCallback = CallBack;
+    gPauseCallback = nullptr;
     gNextExecutionStatus = DEBUG_STATUS_NO_CHANGE;
     gNextContinueStatus = DBG_CONTINUE;
 
@@ -5774,26 +5872,45 @@ __declspec(dllexport) bool ProcessIsWow64(HANDLE hProcess, PBOOL isWow64)
 }
 
 __declspec(dllexport) bool TitanTerminateProcess(HANDLE hProcess, DWORD exitCode) { const auto h = registeredNativeHandle(hProcess, TitanHandleType::Process); return h && !!TerminateProcess(h, exitCode); }
-__declspec(dllexport) bool TitanDebugBreakProcess(HANDLE hProcess)
+__declspec(dllexport) bool RequestPause(TitanPausePolicy MaximumPolicy, TITANCBPAUSE PauseCallback)
 {
-    if (gSessionKind == UE_SESSION_TTD && gIsDebugging && gTtdCursor)
+    if (MaximumPolicy < UE_PAUSE_POLICY_NONINVASIVE || MaximumPolicy > UE_PAUSE_POLICY_AGGRESSIVE ||
+        !PauseCallback || !gIsDebugging)
     {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    if (gSessionKind != UE_SESSION_LIVE && gSessionKind != UE_SESSION_TTD)
+    {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
+
+    TITANCBPAUSE expected = nullptr;
+    if (!gPauseCallback.compare_exchange_strong(expected, PauseCallback))
+        return true;
+
+    if (gSessionKind == UE_SESSION_TTD)
+    {
+        if (!gTtdCursor)
         {
-            std::lock_guard lock(gMutexHandleRegistry);
-            const auto found = gHandleRegistry.find(hProcess);
-            if (found == gHandleRegistry.end() || found->second.type != TitanHandleType::Process ||
-                found->second.sessionGeneration != gSessionGeneration)
-            {
-                SetLastError(ERROR_INVALID_HANDLE);
-                return false;
-            }
+            gPauseCallback = nullptr;
+            SetLastError(ERROR_INVALID_HANDLE);
+            return false;
         }
         gTtdInterruptRequested = true;
         gTtdCursor->InterruptReplay();
         return true;
     }
-    const auto h = registeredNativeHandle(hProcess, TitanHandleType::Process);
-    return h && !!DebugBreakProcess(h);
+
+    const auto hr = gDebugControl ? gDebugControl->SetInterrupt(DEBUG_INTERRUPT_ACTIVE) : E_NOINTERFACE;
+    if (FAILED(hr))
+    {
+        gPauseCallback = nullptr;
+        SetLastError(HRESULT_CODE(hr));
+        return false;
+    }
+    return true;
 }
 __declspec(dllexport) HANDLE TitanCreateRemoteThread(HANDLE hProcess, LPTHREAD_START_ROUTINE start, LPVOID argument, DWORD creationFlags, LPDWORD threadId)
 {

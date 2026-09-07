@@ -51,7 +51,7 @@ struct Api
     decltype(&ReplayGetPosition) ReplayGetPosition = nullptr;
     decltype(&ReplayGetExtent) ReplayGetExtent = nullptr;
     decltype(&ReplaySetPosition) ReplaySetPosition = nullptr;
-    decltype(&ReplayStep) ReplayStep = nullptr;
+    decltype(&ReplayStepBack) ReplayStepBack = nullptr;
     decltype(&SetCustomHandler) SetCustomHandler = nullptr;
     decltype(&TitanCloseHandle) TitanCloseHandle = nullptr;
     decltype(&DebugLoop) DebugLoop = nullptr;
@@ -124,7 +124,7 @@ int wmain(int argc, wchar_t** argv)
     RESOLVE(ReplayGetPosition);
     RESOLVE(ReplayGetExtent);
     RESOLVE(ReplaySetPosition);
-    RESOLVE(ReplayStep);
+    RESOLVE(ReplayStepBack);
     RESOLVE(SetCustomHandler);
     RESOLVE(TitanCloseHandle);
     RESOLVE(DebugLoop);
@@ -187,14 +187,9 @@ int wmain(int argc, wchar_t** argv)
         }
         std::printf("timeline first=%llx:%llx current=%llx:%llx last=%llx:%llx\n",
                     first.sequence, first.steps, current.sequence, current.steps, last.sequence, last.steps);
-        if(!gApi.ReplayStep(false, false, nullptr) || !gApi.ReplayStep(true, false, nullptr))
-        {
-            std::printf("TTD forward/reverse step failed: %lu\n", GetLastError());
-            return 1;
-        }
         if(!gApi.ReplaySetPosition(&last) || !gApi.ReplayGetPosition(&current) ||
            current.sequence != last.sequence || current.steps != last.steps ||
-           !gApi.ReplaySetPosition(&first))
+           !gApi.ReplayStepBack(nullptr) || !gApi.ReplaySetPosition(&first))
         {
             std::printf("TTD exact seek round trip failed: %lu\n", GetLastError());
             return 1;
