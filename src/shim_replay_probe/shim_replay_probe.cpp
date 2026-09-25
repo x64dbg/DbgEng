@@ -110,10 +110,12 @@ int wmain(int argc, wchar_t** argv)
     if(artifact.size() >= 4 && _wcsicmp(artifact.c_str() + artifact.size() - 4, L".run") == 0)
         gExpectedKind = UE_SESSION_TTD;
 
-    const auto module = LoadLibraryW(L"TitanEngine.dll");
+    auto module = LoadLibraryW(L"DbgEng\\TitanEngine.dll");
+    if(!module)
+        module = LoadLibraryW(L"TitanEngine.dll");
     if(!module)
     {
-        std::printf("LoadLibraryW(TitanEngine.dll) failed: %lu\n", GetLastError());
+        std::printf("LoadLibraryW(DbgEng\\TitanEngine.dll) failed: %lu\n", GetLastError());
         return 1;
     }
 

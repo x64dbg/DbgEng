@@ -53,9 +53,6 @@ link-libraries = ["DbgEng", "Delayimp"]
 msvc.link-options = ["/DELAYLOAD:dbgeng.dll"]
 include-after = ["output-folders.cmake"]
 
-[target.DbgEngTitanEngine.properties]
-OUTPUT_NAME = "TitanEngine"
-
 [target.testlib]
 condition = "tools"
 type = "shared"

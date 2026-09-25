@@ -162,8 +162,6 @@ endif()
 set_target_properties(DbgEngTitanEngine PROPERTIES
 	MSVC_RUNTIME_LIBRARY
 		"MultiThreaded$<$<CONFIG:Debug>:Debug>"
-	OUTPUT_NAME
-		TitanEngine
 )
 
 set(CMKR_TARGET DbgEngTitanEngine)
