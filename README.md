@@ -55,6 +55,11 @@ cmake -B build32 -A Win32
 cmake --build build32 --config Debug
 ```
 
+Parent projects can set `DBGENG_BUILD_TOOLS=OFF` to build only the
+`DbgEngTitanEngine` adapter. Setting `DBGENG_OUTPUT_SUBDIR` places the adapter
+and its import artifacts in that output subdirectory; standalone builds leave
+it unset and retain the layout shown above.
+
 **Important**: After building, copy the DbgEng DLLs to the output directory:
 
 ```bash

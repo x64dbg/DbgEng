@@ -31,90 +31,99 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
 
 endif()
 
+# Options
+option(DBGENG_BUILD_TOOLS "" ON)
+
 project(x64dbg-dbgeng)
 
 # Target: playground
-set(playground_SOURCES
-	cmake.toml
-	"src/playground/playground.cpp"
-)
-
-add_executable(playground)
-
-target_sources(playground PRIVATE ${playground_SOURCES})
-source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${playground_SOURCES})
-
-target_compile_features(playground PRIVATE
-	cxx_std_20
-)
-
-target_link_libraries(playground PRIVATE
-	DbgEng
-	Delayimp
-)
-
-if(MSVC) # msvc
-	target_link_options(playground PRIVATE
-		"/DELAYLOAD:dbgeng.dll"
+if(DBGENG_BUILD_TOOLS) # tools
+	set(playground_SOURCES
+		cmake.toml
+		"src/playground/playground.cpp"
 	)
-endif()
 
-get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
-if(NOT CMKR_VS_STARTUP_PROJECT)
-	set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT playground)
-endif()
+	add_executable(playground)
 
+	target_sources(playground PRIVATE ${playground_SOURCES})
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${playground_SOURCES})
+
+	target_compile_features(playground PRIVATE
+		cxx_std_20
+	)
+
+	target_link_libraries(playground PRIVATE
+		DbgEng
+		Delayimp
+	)
+
+	if(MSVC) # msvc
+		target_link_options(playground PRIVATE
+			"/DELAYLOAD:dbgeng.dll"
+		)
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT playground)
+	endif()
+
+endif()
 # Target: replay_probe
-set(replay_probe_SOURCES
-	cmake.toml
-	"src/replay_probe/replay_probe.cpp"
-)
-
-add_executable(replay_probe)
-
-target_sources(replay_probe PRIVATE ${replay_probe_SOURCES})
-source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${replay_probe_SOURCES})
-
-target_compile_features(replay_probe PRIVATE
-	cxx_std_20
-)
-
-target_link_libraries(replay_probe PRIVATE
-	DbgEng
-	Delayimp
-)
-
-if(MSVC) # msvc
-	target_link_options(replay_probe PRIVATE
-		"/DELAYLOAD:dbgeng.dll"
+if(DBGENG_BUILD_TOOLS) # tools
+	set(replay_probe_SOURCES
+		cmake.toml
+		"src/replay_probe/replay_probe.cpp"
 	)
-endif()
 
-get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
-if(NOT CMKR_VS_STARTUP_PROJECT)
-	set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT replay_probe)
-endif()
+	add_executable(replay_probe)
 
+	target_sources(replay_probe PRIVATE ${replay_probe_SOURCES})
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${replay_probe_SOURCES})
+
+	target_compile_features(replay_probe PRIVATE
+		cxx_std_20
+	)
+
+	target_link_libraries(replay_probe PRIVATE
+		DbgEng
+		Delayimp
+	)
+
+	if(MSVC) # msvc
+		target_link_options(replay_probe PRIVATE
+			"/DELAYLOAD:dbgeng.dll"
+		)
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT replay_probe)
+	endif()
+
+endif()
 # Target: shim_replay_probe
-set(shim_replay_probe_SOURCES
-	cmake.toml
-	"src/shim_replay_probe/shim_replay_probe.cpp"
-)
+if(DBGENG_BUILD_TOOLS) # tools
+	set(shim_replay_probe_SOURCES
+		cmake.toml
+		"src/shim_replay_probe/shim_replay_probe.cpp"
+	)
 
-add_executable(shim_replay_probe)
+	add_executable(shim_replay_probe)
 
-target_sources(shim_replay_probe PRIVATE ${shim_replay_probe_SOURCES})
-source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${shim_replay_probe_SOURCES})
+	target_sources(shim_replay_probe PRIVATE ${shim_replay_probe_SOURCES})
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${shim_replay_probe_SOURCES})
 
-target_compile_features(shim_replay_probe PRIVATE
-	cxx_std_20
-)
+	target_compile_features(shim_replay_probe PRIVATE
+		cxx_std_20
+	)
 
-get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
-if(NOT CMKR_VS_STARTUP_PROJECT)
-	set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT shim_replay_probe)
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT shim_replay_probe)
+	endif()
+
 endif()
-
 # Target: DbgEngTitanEngine
 set(DbgEngTitanEngine_SOURCES
 	cmake.toml
@@ -157,85 +166,95 @@ set_target_properties(DbgEngTitanEngine PROPERTIES
 		TitanEngine
 )
 
+set(CMKR_TARGET DbgEngTitanEngine)
+include(output-folders.cmake)
+
 # Target: testlib
-set(testlib_SOURCES
-	cmake.toml
-	"src/testlib/testlib.cpp"
-)
-
-add_library(testlib SHARED)
-
-target_sources(testlib PRIVATE ${testlib_SOURCES})
-source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${testlib_SOURCES})
-
-if(MSVC) # msvc
-	target_link_options(testlib PUBLIC
-		"/INCREMENTAL:NO"
-		"/DYNAMICBASE:NO"
+if(DBGENG_BUILD_TOOLS) # tools
+	set(testlib_SOURCES
+		cmake.toml
+		"src/testlib/testlib.cpp"
 	)
+
+	add_library(testlib SHARED)
+
+	target_sources(testlib PRIVATE ${testlib_SOURCES})
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${testlib_SOURCES})
+
+	if(MSVC) # msvc
+		target_link_options(testlib PUBLIC
+			"/INCREMENTAL:NO"
+			"/DYNAMICBASE:NO"
+		)
+	endif()
+
+	set_target_properties(testlib PROPERTIES
+		MSVC_RUNTIME_LIBRARY
+			"MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
+	)
+
 endif()
-
-set_target_properties(testlib PROPERTIES
-	MSVC_RUNTIME_LIBRARY
-		"MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
-)
-
 # Target: testapp
-set(testapp_SOURCES
-	cmake.toml
-	"src/testapp/debug.h"
-	"src/testapp/testapp.cpp"
-)
-
-add_executable(testapp)
-
-target_sources(testapp PRIVATE ${testapp_SOURCES})
-source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${testapp_SOURCES})
-
-if(NOT TARGET testlib)
-	message(FATAL_ERROR "Target \"testlib\" referenced by \"testapp\" does not exist!")
-endif()
-
-target_link_libraries(testapp PRIVATE
-	testlib
-)
-
-if(MSVC) # msvc
-	target_link_options(testapp PRIVATE
-		"/INCREMENTAL:NO"
-		"/DYNAMICBASE:NO"
+if(DBGENG_BUILD_TOOLS) # tools
+	set(testapp_SOURCES
+		cmake.toml
+		"src/testapp/debug.h"
+		"src/testapp/testapp.cpp"
 	)
+
+	add_executable(testapp)
+
+	target_sources(testapp PRIVATE ${testapp_SOURCES})
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${testapp_SOURCES})
+
+	if(NOT TARGET testlib)
+		message(FATAL_ERROR "Target \"testlib\" referenced by \"testapp\" does not exist!")
+	endif()
+
+	target_link_libraries(testapp PRIVATE
+		testlib
+	)
+
+	if(MSVC) # msvc
+		target_link_options(testapp PRIVATE
+			"/INCREMENTAL:NO"
+			"/DYNAMICBASE:NO"
+		)
+	endif()
+
+	set_target_properties(testapp PROPERTIES
+		MSVC_RUNTIME_LIBRARY
+			"MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
+	)
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT testapp)
+	endif()
+
 endif()
-
-set_target_properties(testapp PROPERTIES
-	MSVC_RUNTIME_LIBRARY
-		"MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
-)
-
-get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
-if(NOT CMKR_VS_STARTUP_PROJECT)
-	set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT testapp)
-endif()
-
 # Target: exception
-set(exception_SOURCES
-	cmake.toml
-	"src/exception/exception.cpp"
-)
-
-add_executable(exception)
-
-target_sources(exception PRIVATE ${exception_SOURCES})
-source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${exception_SOURCES})
-
-if(MSVC) # msvc
-	target_link_options(exception PRIVATE
-		"/INCREMENTAL:NO"
-		"/DYNAMICBASE:NO"
+if(DBGENG_BUILD_TOOLS) # tools
+	set(exception_SOURCES
+		cmake.toml
+		"src/exception/exception.cpp"
 	)
-endif()
 
-get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
-if(NOT CMKR_VS_STARTUP_PROJECT)
-	set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT exception)
+	add_executable(exception)
+
+	target_sources(exception PRIVATE ${exception_SOURCES})
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${exception_SOURCES})
+
+	if(MSVC) # msvc
+		target_link_options(exception PRIVATE
+			"/INCREMENTAL:NO"
+			"/DYNAMICBASE:NO"
+		)
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT exception)
+	endif()
+
 endif()
