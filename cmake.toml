@@ -22,8 +22,9 @@ type = "executable"
 sources = ["src/shim_replay_probe/shim_replay_probe.cpp"]
 compile-features = ["cxx_std_20"]
 
-[target.TitanEngine]
+[target.DbgEngTitanEngine]
 type = "shared"
+msvc-runtime = "static"
 sources = [
 	"src/TitanEngine/TitanEngine.cpp",
 	"src/TTD/TTD.cpp",
@@ -41,6 +42,9 @@ headers = [
 compile-features = ["cxx_std_20"]
 link-libraries = ["DbgEng", "Delayimp"]
 msvc.link-options = ["/DELAYLOAD:dbgeng.dll"]
+
+[target.DbgEngTitanEngine.properties]
+OUTPUT_NAME = "TitanEngine"
 
 [target.testlib]
 type = "shared"

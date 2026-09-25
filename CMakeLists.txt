@@ -115,8 +115,8 @@ if(NOT CMKR_VS_STARTUP_PROJECT)
 	set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT shim_replay_probe)
 endif()
 
-# Target: TitanEngine
-set(TitanEngine_SOURCES
+# Target: DbgEngTitanEngine
+set(DbgEngTitanEngine_SOURCES
 	cmake.toml
 	"src/TTD/TTD.cpp"
 	"src/TTD/TTD.hpp"
@@ -130,25 +130,32 @@ set(TitanEngine_SOURCES
 	"src/TitanEngine/TitanEngine.h"
 )
 
-add_library(TitanEngine SHARED)
+add_library(DbgEngTitanEngine SHARED)
 
-target_sources(TitanEngine PRIVATE ${TitanEngine_SOURCES})
-source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${TitanEngine_SOURCES})
+target_sources(DbgEngTitanEngine PRIVATE ${DbgEngTitanEngine_SOURCES})
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${DbgEngTitanEngine_SOURCES})
 
-target_compile_features(TitanEngine PUBLIC
+target_compile_features(DbgEngTitanEngine PUBLIC
 	cxx_std_20
 )
 
-target_link_libraries(TitanEngine PUBLIC
+target_link_libraries(DbgEngTitanEngine PUBLIC
 	DbgEng
 	Delayimp
 )
 
 if(MSVC) # msvc
-	target_link_options(TitanEngine PUBLIC
+	target_link_options(DbgEngTitanEngine PUBLIC
 		"/DELAYLOAD:dbgeng.dll"
 	)
 endif()
+
+set_target_properties(DbgEngTitanEngine PROPERTIES
+	MSVC_RUNTIME_LIBRARY
+		"MultiThreaded$<$<CONFIG:Debug>:Debug>"
+	OUTPUT_NAME
+		TitanEngine
+)
 
 # Target: testlib
 set(testlib_SOURCES

@@ -1,8 +1,9 @@
 # Simple Command-Line Debugger
 
 A DbgEng-based debugger and TitanEngine-compatible backend for x64dbg. The
-`playground` target provides a small command-line debugger; the `TitanEngine`
-target is the compatibility shim consumed by x64dbg.
+`playground` target provides a small command-line debugger; the
+`DbgEngTitanEngine` target builds the `TitanEngine.dll` compatibility shim
+consumed by x64dbg.
 
 The shim supports live x64 and x86 launch and attach sessions, x64dbg event
 translation, short/long-INT3 and UD2 software breakpoints, DbgEng data/hardware
