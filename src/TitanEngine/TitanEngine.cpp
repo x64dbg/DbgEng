@@ -288,10 +288,11 @@ static bool gComInitialized = false;
 static HANDLE gProcessCreatedEvent = nullptr;
 static const char* gSyntheticDebugString = nullptr;
 static SIZE_T gSyntheticDebugStringSize = 0;
-static std::unique_ptr<TTD::ReplayEngine> gTtdEngine;
-static std::unique_ptr<TTD::Cursor> gTtdCursor;
-static TTD::Position gTtdFirstPosition = {};
-static TTD::Position gTtdLastPosition = {};
+using TtdPosition = TTDReplay::Position;
+static TTDReplay::UniqueReplayEngine gTtdEngine;
+static TTDReplay::UniqueCursor gTtdCursor;
+static TtdPosition gTtdFirstPosition = {};
+static TtdPosition gTtdLastPosition = {};
 static DWORD gTtdProcessId = 1;
 static DWORD gTtdCurrentThreadId = 0;
 static DWORD gTtdMachineType = 0;
@@ -304,7 +305,7 @@ static std::atomic_bool gTtdInterruptRequested = false;
 static bool gTtdCursorChanged = false;
 static bool gTtdNextRunReverse = false;
 static bool gTtdHasProcessExitBoundary = false;
-static TTD::Position gTtdProcessExitBoundary = {};
+static TtdPosition gTtdProcessExitBoundary = {};
 struct TtdWatchHit
 {
     bool pending = false;
@@ -323,6 +324,90 @@ struct TtdStepOverProbe
     ULONG64 returnAddress = 0;
 };
 static TtdStepOverProbe* gTtdStepOverProbe = nullptr;
+
+static TtdPosition makeTtdPosition(ULONG64 sequence, ULONG64 steps)
+{
+    return { static_cast<TTDReplay::SequenceId>(sequence), static_cast<TTDReplay::StepCount>(steps) };
+}
+
+static ULONG64 ttdSequence(const TtdPosition& position)
+{
+    return static_cast<ULONG64>(position.Sequence);
+}
+
+static ULONG64 ttdSteps(const TtdPosition& position)
+{
+    return static_cast<ULONG64>(position.Steps);
+}
+
+static ULONG ttdUniqueThreadId(const TTDReplay::ThreadInfo& info)
+{
+    return static_cast<ULONG>(info.UniqueId);
+}
+
+static DWORD ttdSystemThreadId(const TTDReplay::ThreadInfo& info)
+{
+    return static_cast<DWORD>(info.Id);
+}
+
+static ULONG64 ttdTebAddress(DWORD threadId)
+{
+    return static_cast<ULONG64>(gTtdCursor->GetTebAddress(static_cast<TTDReplay::ThreadId>(threadId)));
+}
+
+static ULONG64 ttdProgramCounter()
+{
+    return static_cast<ULONG64>(gTtdCursor->GetProgramCounter());
+}
+
+static TTDReplay::MemoryWatchpointData ttdWatchpoint(ULONG64 address, ULONG64 size, TTDReplay::DataAccessMask mask)
+{
+    return { static_cast<TTDReplay::GuestAddress>(address), size, mask };
+}
+
+struct TtdReplayResult
+{
+    ULONG64 stepCount = 0;
+    int stopReason = -1;
+};
+
+static TtdReplayResult ttdReplay(bool reverse, const TtdPosition& limit, ULONG64 maxSteps)
+{
+    // UINT64_MAX is StepCount::Invalid, which the engine does not treat as unbounded.
+    const auto steps = maxSteps == UINT64_MAX ? TTDReplay::StepCount::Max : static_cast<TTDReplay::StepCount>(maxSteps);
+    const auto result = reverse ? gTtdCursor->ReplayBackward(limit, steps) : gTtdCursor->ReplayForward(limit, steps);
+    logDebug("TTD replay stop reason {} after {} steps", static_cast<int>(result.StopReason),
+             static_cast<ULONG64>(result.StepsExecuted));
+    return { static_cast<ULONG64>(result.StepsExecuted), static_cast<int>(result.StopReason) };
+}
+
+struct TtdModuleInfo
+{
+    ULONG64 base = 0;
+    ULONG64 size = 0;
+    ULONG checksum = 0;
+    std::wstring path;
+};
+
+// Snapshot of the modules mapped at the cursor's current position.
+static std::vector<TtdModuleInfo> ttdCurrentModules()
+{
+    std::vector<TtdModuleInfo> result;
+    if (!gTtdCursor)
+        return result;
+    const auto modules = gTtdCursor->GetModuleList();
+    const auto count = gTtdCursor->GetModuleCount();
+    result.reserve(count);
+    for (size_t i = 0; modules && i < count; ++i)
+    {
+        const auto module = modules[i].pModule;
+        if (!module || !module->pName)
+            continue;
+        result.push_back({ static_cast<ULONG64>(module->Address), module->Size, module->Checksum,
+                           std::wstring(module->pName, module->NameLength) });
+    }
+    return result;
+}
 
 /* DbgEng interfaces:
 #define INTERFACE IDebugAdvanced4
@@ -474,6 +559,8 @@ static void dispatchSystemBreakpoint(const void* argument)
 
 static void resetTtdSession()
 {
+    // Readers hold gMutexPaused (via PauseLock) while they use the cursor.
+    std::lock_guard lock(gMutexPaused);
     gPauseCallback = nullptr;
     gTtdCursor.reset();
     gTtdEngine.reset();
@@ -692,14 +779,15 @@ static bool protectMemoryBreakpointPage(ULONG_PTR page, bool guarded)
     return true;
 }
 
-static ULONG64 ttdMemoryWatchFlags(TitanMemoryBreakpointType type)
+static TTDReplay::DataAccessMask ttdMemoryWatchMask(TitanMemoryBreakpointType type)
 {
+    using TTDReplay::DataAccessMask;
     switch (type)
     {
-    case UE_MEMORY_READ: return TTD::BP_FLAGS::READ;
-    case UE_MEMORY_WRITE: return TTD::BP_FLAGS::WRITE;
-    case UE_MEMORY_EXECUTE: return TTD::BP_FLAGS::EXEC;
-    default: return TTD::BP_FLAGS::READ | TTD::BP_FLAGS::WRITE | TTD::BP_FLAGS::EXEC;
+    case UE_MEMORY_READ: return DataAccessMask::Read;
+    case UE_MEMORY_WRITE: return DataAccessMask::Write;
+    case UE_MEMORY_EXECUTE: return DataAccessMask::Execute;
+    default: return DataAccessMask::Read | DataAccessMask::Write | DataAccessMask::Execute;
     }
 }
 
@@ -711,12 +799,9 @@ static bool removeMemoryBreakpointById(uint64_t id)
 
     if (gSessionKind == UE_SESSION_TTD)
     {
-        TTD::TTD_Replay_MemoryWatchpointData watchpoint {
-            breakpoint->second.start,
-            breakpoint->second.size,
-            ttdMemoryWatchFlags(breakpoint->second.type),
-        };
-        const auto result = gTtdCursor && gTtdCursor->RemoveMemoryWatchpoint(&watchpoint);
+        const auto watchpoint = ttdWatchpoint(breakpoint->second.start, breakpoint->second.size,
+                                              ttdMemoryWatchMask(breakpoint->second.type));
+        const auto result = gTtdCursor && gTtdCursor->RemoveMemoryWatchpoint(watchpoint);
         if (result)
             gMemoryBreakpoints.erase(breakpoint);
         return result;
@@ -2405,7 +2490,7 @@ __declspec(dllexport) bool MemoryReadUnsafe(HANDLE hProcess, LPCVOID lpBaseAddre
             SetLastError(!gTtdCursor ? ERROR_INVALID_HANDLE : ERROR_INVALID_PARAMETER);
             return false;
         }
-        const auto bytesRead = gTtdCursor->ReadMemoryPartial((ULONG64)(ULONG_PTR)lpBaseAddress, lpBuffer, nSize);
+        const auto bytesRead = TTDReplay::ReadMemoryPartial(*gTtdCursor, (ULONG64)(ULONG_PTR)lpBaseAddress, lpBuffer, nSize);
         if (lpNumberOfBytesRead)
             *lpNumberOfBytesRead = bytesRead;
         if (bytesRead != nSize)
@@ -2562,16 +2647,15 @@ __declspec(dllexport) SIZE_T MemoryQuerySafe(HANDLE hProcess, LPCVOID lpAddress,
             return 0;
         }
         const auto address = (ULONG64)(ULONG_PTR)lpAddress;
-        const auto modules = gTtdCursor->GetModuleList();
-        const auto moduleCount = gTtdCursor->GetModuleCount();
+        const auto modules = ttdCurrentModules();
         std::vector<std::pair<ULONG64, ULONG64>> ranges;
-        ranges.reserve((size_t)moduleCount);
-        for (size_t i = 0; modules && i < moduleCount; ++i)
+        ranges.reserve(modules.size());
+        for (const auto& module : modules)
         {
-            if (!modules[i].module || !modules[i].module->imageSize)
+            if (!module.size)
                 continue;
-            const auto start = modules[i].module->base_addr;
-            const auto end = start + modules[i].module->imageSize;
+            const auto start = module.base;
+            const auto end = start + module.size;
             ranges.emplace_back(start, end);
             if (address >= start && address < end)
             {
@@ -2594,12 +2678,12 @@ __declspec(dllexport) SIZE_T MemoryQuerySafe(HANDLE hProcess, LPCVOID lpAddress,
         const auto threadCount = gTtdCursor->GetThreadCount();
         for (size_t i = 0; threadList && i < threadCount; ++i)
         {
-            const auto thread = threadList[i].info;
+            const auto thread = threadList[i].pThread;
             if (!thread)
                 continue;
-            const auto teb = gTtdCursor->GetTebAddress(thread->threadid);
+            const auto teb = ttdTebAddress(ttdSystemThreadId(*thread));
             ULONG_PTR tib[3] = {};
-            if (teb && gTtdCursor->ReadMemory(teb, tib, sizeof(tib)))
+            if (teb && TTDReplay::ReadMemory(*gTtdCursor, teb, tib, sizeof(tib)))
             {
                 const auto stackBase = (ULONG64)tib[1];
                 const auto stackLimit = (ULONG64)tib[2];
@@ -2641,7 +2725,7 @@ __declspec(dllexport) SIZE_T MemoryQuerySafe(HANDLE hProcess, LPCVOID lpAddress,
 
         const auto page = address & ~0xFFFull;
         BYTE probe = 0;
-        if (gTtdCursor->ReadMemory(address, &probe, 1))
+        if (TTDReplay::ReadMemory(*gTtdCursor, address, &probe, 1))
         {
             *lpBuffer = {};
             lpBuffer->BaseAddress = (PVOID)(ULONG_PTR)page;
@@ -2850,34 +2934,37 @@ __declspec(dllexport) PROCESS_INFORMATION* InitDebugW(const wchar_t* szFileName,
     return &gProcessInfo;
 }
 
-static bool ttdMemoryBreakpointMatches(const MemoryBreakpointInfo& breakpoint, ULONG64 address, ULONG64 flags)
+static bool ttdMemoryBreakpointMatches(const MemoryBreakpointInfo& breakpoint, ULONG64 address, ULONG64 accessType)
 {
+    using TTDReplay::DataAccessType;
     if (address < breakpoint.start || address - breakpoint.start >= breakpoint.size)
         return false;
     return breakpoint.type == UE_MEMORY ||
-           (breakpoint.type == UE_MEMORY_READ && flags == MEM_READ_EVENT_FLAG) ||
-           (breakpoint.type == UE_MEMORY_WRITE && flags == MEM_WRITE_EVENT_FLAG) ||
-           (breakpoint.type == UE_MEMORY_EXECUTE && flags > MEM_WRITE_EVENT_FLAG);
+           (breakpoint.type == UE_MEMORY_READ && accessType == static_cast<ULONG64>(DataAccessType::Read)) ||
+           (breakpoint.type == UE_MEMORY_WRITE && accessType == static_cast<ULONG64>(DataAccessType::Write)) ||
+           (breakpoint.type == UE_MEMORY_EXECUTE && accessType > static_cast<ULONG64>(DataAccessType::Write));
 }
 
-static void __fastcall ttdCallReturnCallback(TTD::CallbackValue, TTD::GuestAddress, TTD::GuestAddress returnAddress,
-                                              TTD::TTD_Replay_IThreadView* threadView)
+static void __fastcall ttdCallReturnCallback(uintptr_t, TTDReplay::GuestAddress, TTDReplay::GuestAddress fallThroughAddress,
+                                              const TTDReplay::IThreadView* threadView)
 {
-    if (!gTtdStepOverProbe || !returnAddress || !threadView || !threadView->IThreadView)
+    const auto returnAddress = static_cast<ULONG64>(fallThroughAddress);
+    if (!gTtdStepOverProbe || !returnAddress || !threadView)
         return;
-    const auto thread = threadView->IThreadView->GetThreadInfo(threadView);
-    if (thread && thread->unk1 == gTtdStepOverProbe->uniqueThreadId)
+    if (ttdUniqueThreadId(threadView->GetThreadInfo()) == gTtdStepOverProbe->uniqueThreadId)
         gTtdStepOverProbe->returnAddress = returnAddress;
 }
 
-static bool __fastcall ttdMemoryWatchpointCallback(TTD::CallbackValue, const TTD::TTD_Replay_MemoryWatchpointResult* result,
-                                                    TTD::TTD_Replay_IThreadView* threadView)
+static bool __fastcall ttdMemoryWatchpointCallback(uintptr_t, const TTDReplay::ICursorView::MemoryWatchpointResult& result,
+                                                    const TTDReplay::IThreadView* threadView)
 {
-    if (!result || !threadView || !threadView->IThreadView)
+    if (!threadView)
         return false;
-    const auto thread = threadView->IThreadView->GetThreadInfo(threadView);
-    const auto position = threadView->IThreadView->GetPosition(threadView);
-    const auto uniqueThreadId = thread ? thread->unk1 : 0;
+    const auto& thread = threadView->GetThreadInfo();
+    const auto& position = threadView->GetPosition();
+    const auto uniqueThreadId = ttdUniqueThreadId(thread);
+    const auto address = static_cast<ULONG64>(result.Address);
+    const auto accessType = static_cast<ULONG64>(result.AccessType);
 
     // TTD watchpoints are cursor-global. A thread-affine temporary step-over
     // breakpoint must let matching executions in peer threads pass without
@@ -2886,7 +2973,7 @@ static bool __fastcall ttdMemoryWatchpointCallback(TTD::CallbackValue, const TTD
     bool acceptedWatchpoint = false;
     for (const auto& [id, breakpoint] : gBreakpoints)
     {
-        if (breakpoint.kind != BreakpointKind::Software || breakpoint.offset != result->addr)
+        if (breakpoint.kind != BreakpointKind::Software || breakpoint.offset != address)
             continue;
         registeredWatchpoint = true;
         if (!breakpoint.ttdThreadAffinity || breakpoint.ttdThreadAffinity == uniqueThreadId)
@@ -2894,7 +2981,7 @@ static bool __fastcall ttdMemoryWatchpointCallback(TTD::CallbackValue, const TTD
     }
     for (const auto& [id, breakpoint] : gMemoryBreakpoints)
     {
-        if (!ttdMemoryBreakpointMatches(breakpoint, result->addr, result->flags))
+        if (!ttdMemoryBreakpointMatches(breakpoint, address, accessType))
             continue;
         registeredWatchpoint = true;
         acceptedWatchpoint = true;
@@ -2903,22 +2990,43 @@ static bool __fastcall ttdMemoryWatchpointCallback(TTD::CallbackValue, const TTD
         return false;
 
     gTtdWatchHit.pending = true;
-    gTtdWatchHit.address = result->addr;
-    gTtdWatchHit.size = result->size;
-    gTtdWatchHit.flags = result->flags;
-    gTtdWatchHit.sequence = position ? position->Major : 0;
-    gTtdWatchHit.steps = position ? position->Minor : 0;
+    gTtdWatchHit.address = address;
+    gTtdWatchHit.size = result.Size;
+    gTtdWatchHit.flags = accessType;
+    gTtdWatchHit.sequence = ttdSequence(position);
+    gTtdWatchHit.steps = ttdSteps(position);
     gTtdWatchHit.uniqueThreadId = uniqueThreadId;
-    gTtdWatchHit.threadId = thread ? thread->threadid : 0;
+    gTtdWatchHit.threadId = ttdSystemThreadId(thread);
     return true;
+}
+
+static DWORD ttdModuleMachineType(ULONG64 imageBase)
+{
+    if (!gTtdCursor || !imageBase)
+        return IMAGE_FILE_MACHINE_UNKNOWN;
+
+    IMAGE_DOS_HEADER dosHeader = {};
+    if (!TTDReplay::ReadMemory(*gTtdCursor, imageBase, &dosHeader, sizeof(dosHeader)) ||
+        dosHeader.e_magic != IMAGE_DOS_SIGNATURE || dosHeader.e_lfanew <= 0 ||
+        dosHeader.e_lfanew > 0x1000000)
+        return IMAGE_FILE_MACHINE_UNKNOWN;
+
+    DWORD signature = 0;
+    WORD machine = IMAGE_FILE_MACHINE_UNKNOWN;
+    const auto ntHeaders = imageBase + static_cast<ULONG>(dosHeader.e_lfanew);
+    if (!TTDReplay::ReadMemory(*gTtdCursor, ntHeaders, &signature, sizeof(signature)) ||
+        signature != IMAGE_NT_SIGNATURE ||
+        !TTDReplay::ReadMemory(*gTtdCursor, ntHeaders + sizeof(signature), &machine, sizeof(machine)))
+        return IMAGE_FILE_MACHINE_UNKNOWN;
+    return machine;
 }
 
 // The caller holds gMutexPaused and has already checked for an existing
 // software breakpoint at this address.
 static bool addTtdSoftwareBreakpoint(ULONG_PTR address, TITANCBSOFTBP callback, bool oneShot, ULONG threadAffinity)
 {
-    TTD::TTD_Replay_MemoryWatchpointData watchpoint { address, 1, TTD::BP_FLAGS::EXEC };
-    if (!gTtdCursor || !gTtdCursor->AddMemoryWatchpoint(&watchpoint))
+    const auto watchpoint = ttdWatchpoint(address, 1, TTDReplay::DataAccessMask::Execute);
+    if (!gTtdCursor || !gTtdCursor->AddMemoryWatchpoint(watchpoint))
     {
         SetLastError(ERROR_GEN_FAILURE);
         return false;
@@ -2987,84 +3095,102 @@ __declspec(dllexport) PROCESS_INFORMATION* InitReplayW(const wchar_t* szArtifact
 
     if (ExpectedKind == UE_SESSION_TTD)
     {
-        try
+        gTtdEngine = TTDReplay::CreateEngine();
+        if (!gTtdEngine)
         {
-            gTtdEngine = std::make_unique<TTD::ReplayEngine>();
-            if (!gTtdEngine->Initialize(szArtifactPath))
-            {
-                logError("TTD replay engine rejected the trace");
-                return fail(E_FAIL, ERROR_BAD_FORMAT);
-            }
-            gTtdFirstPosition = *gTtdEngine->GetFirstPosition();
-            gTtdLastPosition = *gTtdEngine->GetLastPosition();
-            gTtdCursor = std::make_unique<TTD::Cursor>(gTtdEngine->NewCursor());
-            gTtdCursor->SetMemoryWatchpointCallback(ttdMemoryWatchpointCallback, 0);
-            gTtdCursor->SetPosition(&gTtdFirstPosition);
+            const auto error = GetLastError();
+            logError("Unable to create the TTD replay engine (error {})", error);
+            return fail(HRESULT_FROM_WIN32(error), ERROR_NOT_SUPPORTED);
         }
-        catch (const std::exception& exception)
+        if (!gTtdEngine->Initialize(szArtifactPath))
         {
-            logError("Failed to initialize TTD replay: {}", exception.what());
+            logError("TTD replay engine rejected the trace");
+            return fail(E_FAIL, ERROR_BAD_FORMAT);
+        }
+        gTtdFirstPosition = gTtdEngine->GetFirstPosition();
+        gTtdLastPosition = gTtdEngine->GetLastPosition();
+        gTtdCursor.reset(gTtdEngine->NewCursor());
+        if (!gTtdCursor)
+        {
+            logError("Unable to create a TTD replay cursor");
             return fail(E_FAIL, ERROR_NOT_SUPPORTED);
         }
+        gTtdCursor->SetMemoryWatchpointCallback(ttdMemoryWatchpointCallback, 0);
+        gTtdCursor->SetPosition(gTtdFirstPosition);
 
-        const auto peb = gTtdEngine->GetPebAddress();
-        gTtdMachineType = peb > UINT32_MAX ? IMAGE_FILE_MACHINE_AMD64 : IMAGE_FILE_MACHINE_I386;
-#ifdef _WIN64
-        if (gTtdMachineType != IMAGE_FILE_MACHINE_AMD64)
-#else
-        if (gTtdMachineType != IMAGE_FILE_MACHINE_I386)
-#endif
-        {
-            logError("TTD trace architecture does not match the adapter");
-            return fail(HRESULT_FROM_WIN32(ERROR_EXE_MACHINE_TYPE_MISMATCH), ERROR_EXE_MACHINE_TYPE_MISMATCH);
-        }
-
+        const auto peb = static_cast<ULONG64>(gTtdEngine->GetPebAddress());
         const auto activeThreadCount = gTtdCursor->GetThreadCount();
         const auto activeThreads = gTtdCursor->GetThreadList();
-        const auto currentThread = gTtdCursor->GetThreadInfo();
-        if (!activeThreadCount || !activeThreads || !currentThread)
+        if (!activeThreadCount || !activeThreads)
         {
             logError("TTD trace has no active bootstrap thread");
             return fail(E_FAIL, ERROR_BAD_FORMAT);
         }
-        gTtdCurrentThreadId = currentThread->threadid;
+        const auto& currentThread = gTtdCursor->GetThreadInfo();
+        gTtdCurrentThreadId = ttdSystemThreadId(currentThread);
 
-        const auto modules = gTtdCursor->GetModuleList();
-        const auto moduleCount = gTtdCursor->GetModuleCount();
-        if (!modules || !moduleCount)
+        const auto modules = ttdCurrentModules();
+        if (modules.empty())
         {
             logError("TTD trace has no bootstrap modules");
             return fail(E_FAIL, ERROR_BAD_FORMAT);
         }
+        const auto moduleCount = modules.size();
         size_t mainModule = 0;
         for (size_t i = 0; i < moduleCount; ++i)
         {
-            const auto module = modules[i].module;
-            if (!module || !module->path)
-                continue;
-            std::wstring path(module->path, module->path_len);
+            const auto& path = modules[i].path;
             const auto slash = path.find_last_of(L"\\/");
             const auto name = path.substr(slash == std::wstring::npos ? 0 : slash + 1);
             if (name.size() >= 4 && _wcsicmp(name.c_str() + name.size() - 4, L".exe") == 0)
             {
                 mainModule = i;
-                gTtdImagePath = std::move(path);
+                gTtdImagePath = path;
                 break;
             }
         }
-        if (gTtdImagePath.empty() && modules[mainModule].module && modules[mainModule].module->path)
-            gTtdImagePath.assign(modules[mainModule].module->path, modules[mainModule].module->path_len);
-        for (size_t i = 0; i < moduleCount; ++i)
+        if (gTtdImagePath.empty())
+            gTtdImagePath = modules[mainModule].path;
+        for (const auto& module : modules)
+            gTtdActiveModules[module.base] = module.path;
+
+        const auto& image = modules[mainModule];
+        gTtdMachineType = ttdModuleMachineType(image.base);
+        if (gTtdMachineType == IMAGE_FILE_MACHINE_UNKNOWN)
         {
-            const auto module = modules[i].module;
-            if (module && module->path)
-                gTtdActiveModules[module->base_addr] = std::wstring(module->path, module->path_len);
+            // The main image can be absent at an unusual first position. Any
+            // mapped PE still describes the recorded process architecture.
+            for (size_t i = 0; i < moduleCount; ++i)
+            {
+                const auto machine = ttdModuleMachineType(modules[i].base);
+                if (machine == IMAGE_FILE_MACHINE_I386 || machine == IMAGE_FILE_MACHINE_AMD64)
+                {
+                    gTtdMachineType = machine;
+                    break;
+                }
+            }
+        }
+        if (gTtdMachineType != IMAGE_FILE_MACHINE_I386 && gTtdMachineType != IMAGE_FILE_MACHINE_AMD64)
+        {
+            logError("Unable to determine the TTD trace architecture from its mapped images");
+            return fail(E_FAIL, ERROR_BAD_FORMAT);
+        }
+#ifdef _WIN64
+        constexpr DWORD adapterMachineType = IMAGE_FILE_MACHINE_AMD64;
+#else
+        constexpr DWORD adapterMachineType = IMAGE_FILE_MACHINE_I386;
+#endif
+        if (gTtdMachineType != adapterMachineType)
+        {
+            logError("TTD trace architecture ({:#x}) does not match the adapter ({:#x})",
+                     gTtdMachineType, adapterMachineType);
+            return fail(HRESULT_FROM_WIN32(ERROR_EXE_MACHINE_TYPE_MISMATCH), ERROR_EXE_MACHINE_TYPE_MISMATCH);
         }
 
         constexpr ULONG processIndex = 0;
         const auto processSystemId = gTtdProcessId;
-        const auto threadIndex = currentThread->unk1;
-        const auto threadSystemId = currentThread->threadid;
+        const auto threadIndex = ttdUniqueThreadId(currentThread);
+        const auto threadSystemId = ttdSystemThreadId(currentThread);
         const auto eventProcess = createSyntheticTitanHandle(TitanHandleType::Process, processIndex, processSystemId, false);
         const auto eventThread = createSyntheticTitanHandle(TitanHandleType::Thread, threadIndex, threadSystemId, false);
         gDebugIdMap.processIndexToHandle[processIndex] = eventProcess;
@@ -3072,12 +3198,11 @@ __declspec(dllexport) PROCESS_INFORMATION* InitReplayW(const wchar_t* szArtifact
         gDebugIdMap.threadIndexToHandle[threadIndex] = eventThread;
         gDebugIdMap.threadHandleToIndex[eventThread] = threadIndex;
         gProcessPebCache[eventProcess] = peb;
-        const auto teb = gTtdCursor->GetTebAddress(threadSystemId);
+        const auto teb = ttdTebAddress(threadSystemId);
         gProcessTebCache[eventThread] = teb;
 
-        const auto image = modules[mainModule].module;
-        const auto imageBase = image ? image->base_addr : 0;
-        const auto instruction = gTtdCursor->GetProgramCounter();
+        const auto imageBase = image.base;
+        const auto instruction = ttdProgramCounter();
         gProcessInfo.hProcess = eventProcess;
         gProcessInfo.hThread = eventThread;
         gProcessInfo.dwProcessId = processSystemId;
@@ -3085,28 +3210,29 @@ __declspec(dllexport) PROCESS_INFORMATION* InitReplayW(const wchar_t* szArtifact
         gSessionKind = UE_SESSION_TTD;
 
         gEventCallbacks->CreateProcess(0, (ULONG64)(uintptr_t)eventProcess, imageBase,
-                                       image ? (ULONG)image->imageSize : 0,
-                                       nullptr, gTtdImagePath.c_str(), image ? image->checkSum : 0, 0,
+                                       (ULONG)image.size,
+                                       nullptr, gTtdImagePath.c_str(), image.checksum, 0,
                                        (ULONG64)(uintptr_t)eventThread, teb, instruction);
         for (size_t i = 0; i < activeThreadCount; ++i)
         {
-            const auto info = activeThreads[i].info;
-            if (!info || info->threadid == threadSystemId)
+            const auto info = activeThreads[i].pThread;
+            if (!info || ttdSystemThreadId(*info) == threadSystemId)
                 continue;
-            const auto token = createSyntheticTitanHandle(TitanHandleType::Thread, info->unk1, info->threadid, false);
-            gDebugIdMap.threadIndexToHandle[info->unk1] = token;
-            gDebugIdMap.threadHandleToIndex[token] = info->unk1;
-            const auto threadTeb = gTtdCursor->GetTebAddress(info->threadid);
+            const auto uniqueId = ttdUniqueThreadId(*info);
+            const auto token = createSyntheticTitanHandle(TitanHandleType::Thread, uniqueId, ttdSystemThreadId(*info), false);
+            gDebugIdMap.threadIndexToHandle[uniqueId] = token;
+            gDebugIdMap.threadHandleToIndex[token] = uniqueId;
+            const auto threadTeb = ttdTebAddress(ttdSystemThreadId(*info));
             gProcessTebCache[token] = threadTeb;
             gEventCallbacks->CreateThread((ULONG64)(uintptr_t)token, threadTeb, 0);
         }
         for (size_t i = 0; i < moduleCount; ++i)
         {
-            if (i == mainModule || !modules[i].module)
+            if (i == mainModule)
                 continue;
-            const auto module = modules[i].module;
-            gEventCallbacks->LoadModule(0, module->base_addr, (ULONG)module->imageSize,
-                                        nullptr, module->path, module->checkSum, 0);
+            const auto& module = modules[i];
+            gEventCallbacks->LoadModule(0, module.base, (ULONG)module.size,
+                                        nullptr, module.path.c_str(), module.checksum, 0);
         }
         queueCallback([instruction]
         {
@@ -3360,10 +3486,7 @@ static bool updateTtdCursorIdentity()
 {
     if (!gTtdCursor)
         return false;
-    const auto info = gTtdCursor->GetThreadInfo();
-    if (!info)
-        return false;
-    gTtdCurrentThreadId = info->threadid;
+    gTtdCurrentThreadId = ttdSystemThreadId(gTtdCursor->GetThreadInfo());
     gFakeDebugEvent.dwProcessId = gTtdProcessId;
     gFakeDebugEvent.dwThreadId = gTtdCurrentThreadId;
     gTtdCursorChanged = true;
@@ -3380,16 +3503,18 @@ static void refreshTtdTimeline()
     const auto activeThreadCount = gTtdCursor->GetThreadCount();
     for (size_t i = 0; activeThreads && i < activeThreadCount; ++i)
     {
-        const auto info = activeThreads[i].info;
+        const auto info = activeThreads[i].pThread;
         if (!info)
             continue;
-        activeThreadIndices.insert(info->unk1);
-        if (gDebugIdMap.threadIndexToHandle.contains(info->unk1))
+        const auto uniqueId = ttdUniqueThreadId(*info);
+        const auto systemId = ttdSystemThreadId(*info);
+        activeThreadIndices.insert(uniqueId);
+        if (gDebugIdMap.threadIndexToHandle.contains(uniqueId))
             continue;
-        const auto token = createSyntheticTitanHandle(TitanHandleType::Thread, info->unk1, info->threadid, false);
-        gDebugIdMap.threadIndexToHandle[info->unk1] = token;
-        gDebugIdMap.threadHandleToIndex[token] = info->unk1;
-        const auto teb = gTtdCursor->GetTebAddress(info->threadid);
+        const auto token = createSyntheticTitanHandle(TitanHandleType::Thread, uniqueId, systemId, false);
+        gDebugIdMap.threadIndexToHandle[uniqueId] = token;
+        gDebugIdMap.threadHandleToIndex[token] = uniqueId;
+        const auto teb = ttdTebAddress(systemId);
         gProcessTebCache[token] = teb;
         gEventCallbacks->CreateThread((ULONG64)(uintptr_t)token, teb, 0);
     }
@@ -3425,17 +3550,12 @@ static void refreshTtdTimeline()
     }
 
     std::map<ULONG64, std::wstring> currentModules;
-    const auto modules = gTtdCursor->GetModuleList();
-    const auto moduleCount = gTtdCursor->GetModuleCount();
-    for (size_t i = 0; modules && i < moduleCount; ++i)
+    for (const auto& module : ttdCurrentModules())
     {
-        const auto module = modules[i].module;
-        if (!module || !module->path)
-            continue;
-        currentModules[module->base_addr] = std::wstring(module->path, module->path_len);
-        if (!gTtdActiveModules.contains(module->base_addr))
-            gEventCallbacks->LoadModule(0, module->base_addr, (ULONG)module->imageSize,
-                                        nullptr, module->path, module->checkSum, 0);
+        currentModules[module.base] = module.path;
+        if (!gTtdActiveModules.contains(module.base))
+            gEventCallbacks->LoadModule(0, module.base, (ULONG)module.size,
+                                        nullptr, module.path.c_str(), module.checksum, 0);
     }
     for (const auto& [base, path] : gTtdActiveModules)
     {
@@ -3459,8 +3579,8 @@ static bool queueTtdWatchpointHit(const TtdWatchHit& hit)
         const auto oneShot = breakpoint.oneShot;
         if (oneShot)
         {
-            TTD::TTD_Replay_MemoryWatchpointData watchpoint { breakpoint.offset, 1, TTD::BP_FLAGS::EXEC };
-            gTtdCursor->RemoveMemoryWatchpoint(&watchpoint);
+            const auto watchpoint = ttdWatchpoint(breakpoint.offset, 1, TTDReplay::DataAccessMask::Execute);
+            gTtdCursor->RemoveMemoryWatchpoint(watchpoint);
             gBreakpoints.erase(id);
         }
         queueCallback([hit, callback]
@@ -3521,14 +3641,9 @@ __declspec(dllexport) bool ReplayGetPosition(TITAN_REPLAY_POSITION* Position)
         return false;
     }
     std::lock_guard lock(gMutexPaused);
-    const auto current = gTtdCursor->GetPosition();
-    if (!current)
-    {
-        SetLastError(ERROR_INVALID_DATA);
-        return false;
-    }
-    Position->sequence = current->Major;
-    Position->steps = current->Minor;
+    const auto& current = gTtdCursor->GetPosition();
+    Position->sequence = ttdSequence(current);
+    Position->steps = ttdSteps(current);
     return true;
 }
 
@@ -3548,10 +3663,10 @@ __declspec(dllexport) bool ReplayGetExtent(TITAN_REPLAY_POSITION* First, TITAN_R
         SetLastError(ERROR_NOT_SUPPORTED);
         return false;
     }
-    First->sequence = gTtdFirstPosition.Major;
-    First->steps = gTtdFirstPosition.Minor;
-    Last->sequence = gTtdLastPosition.Major;
-    Last->steps = gTtdLastPosition.Minor;
+    First->sequence = ttdSequence(gTtdFirstPosition);
+    First->steps = ttdSteps(gTtdFirstPosition);
+    Last->sequence = ttdSequence(gTtdLastPosition);
+    Last->steps = ttdSteps(gTtdLastPosition);
     return true;
 }
 
@@ -3567,16 +3682,15 @@ __declspec(dllexport) bool ReplaySetPosition(const TITAN_REPLAY_POSITION* Positi
         SetLastError(ERROR_NOT_SUPPORTED);
         return false;
     }
-    TTD::Position requested { Position->sequence, Position->steps };
+    const auto requested = makeTtdPosition(Position->sequence, Position->steps);
     if (requested < gTtdFirstPosition || requested > gTtdLastPosition || (gIsDebugging && !gPaused))
     {
         SetLastError(gIsDebugging && !gPaused ? ERROR_BUSY : ERROR_INVALID_PARAMETER);
         return false;
     }
     std::lock_guard lock(gMutexPaused);
-    gTtdCursor->SetPosition(const_cast<TTD::Position*>(&requested));
-    const auto actual = gTtdCursor->GetPosition();
-    if (!actual || actual->Major != requested.Major || actual->Minor != requested.Minor || !updateTtdCursorIdentity())
+    gTtdCursor->SetPosition(requested);
+    if (gTtdCursor->GetPosition() != requested || !updateTtdCursorIdentity())
     {
         SetLastError(ERROR_INVALID_DATA);
         return false;
@@ -3619,13 +3733,12 @@ static bool replayStep(bool Reverse, bool StepOver, TITANCBSTEP StepCallBack)
         return false;
     }
 
-    TTD::TTD_Replay_ICursorView_ReplayResult result = {};
+    TtdReplayResult result = {};
     TtdWatchHit hit = {};
     bool continueStepOver = false;
     {
         std::lock_guard lock(gMutexPaused);
-        const auto before = gTtdCursor->GetPosition();
-        const TTD::Position beforePosition = before ? *before : TTD::Position {};
+        const TtdPosition beforePosition = gTtdCursor->GetPosition();
         if (!Reverse && gTtdHasProcessExitBoundary && beforePosition == gTtdProcessExitBoundary)
         {
             SetLastError(ERROR_NO_MORE_ITEMS);
@@ -3635,16 +3748,10 @@ static bool replayStep(bool Reverse, bool StepOver, TITANCBSTEP StepCallBack)
         TtdStepOverProbe stepOverProbe;
         if (StepOver)
         {
-            const auto thread = gTtdCursor->GetThreadInfo();
-            if (!thread)
-            {
-                SetLastError(ERROR_INVALID_DATA);
-                return false;
-            }
-            stepOverProbe.uniqueThreadId = thread->unk1;
+            stepOverProbe.uniqueThreadId = ttdUniqueThreadId(gTtdCursor->GetThreadInfo());
             gTtdStepOverProbe = &stepOverProbe;
             logDebug("Probing TTD step-over on unique thread {} at {:#x}:{:#x}",
-                     stepOverProbe.uniqueThreadId, beforePosition.Major, beforePosition.Minor);
+                     stepOverProbe.uniqueThreadId, ttdSequence(beforePosition), ttdSteps(beforePosition));
             gTtdCursor->SetCallReturnCallback(ttdCallReturnCallback, 0);
         }
 
@@ -3653,9 +3760,9 @@ static bool replayStep(bool Reverse, bool StepOver, TITANCBSTEP StepCallBack)
             result = {};
             gTtdWatchHit = {};
             if (Reverse)
-                gTtdCursor->ReplayBackward(&result, &gTtdFirstPosition, 1);
+                result = ttdReplay(true, gTtdFirstPosition, 1);
             else
-                gTtdCursor->ReplayForward(&result, &gTtdLastPosition, 1);
+                result = ttdReplay(false, gTtdLastPosition, 1);
             if (result.stepCount || !gTtdWatchHit.pending)
                 break;
 
@@ -3663,15 +3770,15 @@ static bool replayStep(bool Reverse, bool StepOver, TITANCBSTEP StepCallBack)
             // position as a zero-step hit. Ignore that stale notification and
             // retry so a step away from a forward- or reverse-hit logical code
             // breakpoint remains a single step instead of becoming a run.
-            if (gTtdWatchHit.sequence != beforePosition.Major || gTtdWatchHit.steps != beforePosition.Minor)
+            if (gTtdWatchHit.sequence != ttdSequence(beforePosition) || gTtdWatchHit.steps != ttdSteps(beforePosition))
             {
-                TTD::Position watchPosition { gTtdWatchHit.sequence, gTtdWatchHit.steps };
-                gTtdCursor->SetPositionOnThread(gTtdWatchHit.uniqueThreadId, &watchPosition);
+                const auto watchPosition = makeTtdPosition(gTtdWatchHit.sequence, gTtdWatchHit.steps);
+                gTtdCursor->SetPositionOnThread(static_cast<TTDReplay::UniqueThreadId>(gTtdWatchHit.uniqueThreadId), watchPosition);
                 result.stepCount = 1;
                 break;
             }
             logDebug("Ignoring a stale TTD watchpoint notification while stepping at {:#x}:{:#x}",
-                     beforePosition.Major, beforePosition.Minor);
+                     ttdSequence(beforePosition), ttdSteps(beforePosition));
         }
         if (StepOver)
         {
@@ -3742,34 +3849,29 @@ __declspec(dllexport) bool ReplayStepBack(TITANCBSTEP StepCallBack)
 
 static bool runTtd(bool reverse)
 {
-    TTD::TTD_Replay_ICursorView_ReplayResult result = {};
+    TtdReplayResult result = {};
     TtdWatchHit hit = {};
-    TTD::TTD_Replay_ExceptionEvent exceptionEvent = {};
+    TTDReplay::ExceptionEvent exceptionEvent = {};
     bool exceptionEventHit = false;
     {
         std::lock_guard lock(gMutexPaused);
         gTtdWatchHit = {};
-        const auto before = gTtdCursor->GetPosition();
-        const TTD::Position beforePosition = before ? *before : TTD::Position {};
+        const TtdPosition beforePosition = gTtdCursor->GetPosition();
         logDebug("TTD {} run from {:#x}:{:#x}", reverse ? "reverse" : "forward",
-                 beforePosition.Major, beforePosition.Minor);
-        TTD::Position movementLimit = reverse ? gTtdFirstPosition : gTtdLastPosition;
+                 ttdSequence(beforePosition), ttdSteps(beforePosition));
+        TtdPosition movementLimit = reverse ? gTtdFirstPosition : gTtdLastPosition;
         const auto exceptionEvents = gTtdEngine->GetExceptionEventList();
         const auto exceptionCount = gTtdEngine->GetExceptionEventCount();
         for (size_t i = 0; exceptionEvents && i < exceptionCount; ++i)
         {
             const auto& event = exceptionEvents[i];
-            const bool afterCurrent = event.pos.Major > beforePosition.Major ||
-                                      (event.pos.Major == beforePosition.Major && event.pos.Minor > beforePosition.Minor);
-            const bool beforeCurrent = event.pos.Major < beforePosition.Major ||
-                                       (event.pos.Major == beforePosition.Major && event.pos.Minor < beforePosition.Minor);
-            const bool betterForward = event.pos.Major < movementLimit.Major ||
-                                       (event.pos.Major == movementLimit.Major && event.pos.Minor < movementLimit.Minor);
-            const bool betterReverse = event.pos.Major > movementLimit.Major ||
-                                       (event.pos.Major == movementLimit.Major && event.pos.Minor > movementLimit.Minor);
+            const bool afterCurrent = event.Position > beforePosition;
+            const bool beforeCurrent = event.Position < beforePosition;
+            const bool betterForward = event.Position < movementLimit;
+            const bool betterReverse = event.Position > movementLimit;
             if ((!reverse && afterCurrent && betterForward) || (reverse && beforeCurrent && betterReverse))
             {
-                movementLimit = event.pos;
+                movementLimit = event.Position;
                 exceptionEvent = event;
                 exceptionEventHit = true;
             }
@@ -3783,21 +3885,21 @@ static bool runTtd(bool reverse)
             {
                 // UINT64_MAX is treated as a zero-length reverse replay by this
                 // TTD runtime. A large finite bound preserves watchpoint search.
-                gTtdCursor->ReplayBackward(&result, &movementLimit, 0x10000000ull);
+                result = ttdReplay(true, movementLimit, 0x10000000ull);
             }
             else
-                gTtdCursor->ReplayForward(&result, &movementLimit, UINT64_MAX);
+                result = ttdReplay(false, movementLimit, UINT64_MAX);
             if (result.stepCount || !gTtdWatchHit.pending)
                 break;
-            if (gTtdWatchHit.sequence != beforePosition.Major || gTtdWatchHit.steps != beforePosition.Minor)
+            if (gTtdWatchHit.sequence != ttdSequence(beforePosition) || gTtdWatchHit.steps != ttdSteps(beforePosition))
             {
-                TTD::Position watchPosition { gTtdWatchHit.sequence, gTtdWatchHit.steps };
-                gTtdCursor->SetPositionOnThread(gTtdWatchHit.uniqueThreadId, &watchPosition);
-                const auto selectedThread = gTtdCursor->GetThreadInfo();
+                const auto watchPosition = makeTtdPosition(gTtdWatchHit.sequence, gTtdWatchHit.steps);
+                gTtdCursor->SetPositionOnThread(static_cast<TTDReplay::UniqueThreadId>(gTtdWatchHit.uniqueThreadId), watchPosition);
+                const auto& selectedThread = gTtdCursor->GetThreadInfo();
                 logDebug("Selected TTD watchpoint thread unique {} system {} (current unique {} system {}, pc {:#x})",
                          gTtdWatchHit.uniqueThreadId, gTtdWatchHit.threadId,
-                         selectedThread ? selectedThread->unk1 : 0, selectedThread ? selectedThread->threadid : 0,
-                         gTtdCursor->GetProgramCounter());
+                         ttdUniqueThreadId(selectedThread), ttdSystemThreadId(selectedThread),
+                         ttdProgramCounter());
                 result.stepCount = 1;
                 break;
             }
@@ -3811,53 +3913,42 @@ static bool runTtd(bool reverse)
             {
                 if (gTtdStopRequested || gTtdInterruptRequested)
                     break;
-                TTD::TTD_Replay_ICursorView_ReplayResult singleStep = {};
                 gTtdWatchHit = {};
-                gTtdCursor->ReplayBackward(&singleStep, &movementLimit, 1);
+                const auto singleStep = ttdReplay(true, movementLimit, 1);
                 if (!singleStep.stepCount && !gTtdWatchHit.pending)
                     break;
                 totalSteps += singleStep.stepCount;
                 if (gTtdWatchHit.pending)
                     break;
-                const auto position = gTtdCursor->GetPosition();
-                if (!position || position->Major < movementLimit.Major ||
-                    (position->Major == movementLimit.Major && position->Minor <= movementLimit.Minor))
+                if (gTtdCursor->GetPosition() <= movementLimit)
                     break;
             }
             result.stepCount = totalSteps;
         }
         if (gTtdWatchHit.pending)
         {
-            const auto position = gTtdCursor->GetPosition();
-            if (!position || position->Major != gTtdWatchHit.sequence || position->Minor != gTtdWatchHit.steps)
+            const auto& position = gTtdCursor->GetPosition();
+            if (ttdSequence(position) != gTtdWatchHit.sequence || ttdSteps(position) != gTtdWatchHit.steps)
             {
-                TTD::Position watchPosition { gTtdWatchHit.sequence, gTtdWatchHit.steps };
-                gTtdCursor->SetPositionOnThread(gTtdWatchHit.uniqueThreadId, &watchPosition);
+                const auto watchPosition = makeTtdPosition(gTtdWatchHit.sequence, gTtdWatchHit.steps);
+                gTtdCursor->SetPositionOnThread(static_cast<TTDReplay::UniqueThreadId>(gTtdWatchHit.uniqueThreadId), watchPosition);
                 if (!result.stepCount)
                     result.stepCount = 1;
             }
         }
-        const auto terminalPosition = gTtdCursor->GetPosition();
-        exceptionEventHit = exceptionEventHit && terminalPosition &&
-                            terminalPosition->Major == exceptionEvent.pos.Major &&
-                            terminalPosition->Minor == exceptionEvent.pos.Minor;
+        exceptionEventHit = exceptionEventHit && gTtdCursor->GetPosition() == exceptionEvent.Position;
         if (!reverse && result.stepCount && !gTtdWatchHit.pending && !exceptionEventHit &&
             !gTtdStopRequested && !gTtdInterruptRequested)
         {
             // ReplayForward stops at the process-exit event, where TTD exposes
             // only a sparse post-exit stack. Park one instruction earlier so
             // the non-destructive exit boundary retains the final full context.
-            TTD::TTD_Replay_ICursorView_ReplayResult parkResult = {};
             gTtdWatchHit = {};
-            gTtdCursor->ReplayBackward(&parkResult, &gTtdFirstPosition, 1);
+            const auto parkResult = ttdReplay(true, gTtdFirstPosition, 1);
             if (parkResult.stepCount)
             {
-                const auto boundary = gTtdCursor->GetPosition();
-                if (boundary)
-                {
-                    gTtdProcessExitBoundary = *boundary;
-                    gTtdHasProcessExitBoundary = true;
-                }
+                gTtdProcessExitBoundary = gTtdCursor->GetPosition();
+                gTtdHasProcessExitBoundary = true;
                 logDebug("Parked TTD cursor at the final executable position before process exit");
             }
             gTtdWatchHit = {};
@@ -3868,9 +3959,9 @@ static bool runTtd(bool reverse)
         hit = gTtdWatchHit;
         gTtdWatchHit = {};
         refreshTtdTimeline();
-        const auto after = gTtdCursor->GetPosition();
+        const auto& after = gTtdCursor->GetPosition();
         logDebug("TTD {} run stopped at {:#x}:{:#x} after {} steps (watch {:#x})",
-                 reverse ? "reverse" : "forward", after ? after->Major : 0, after ? after->Minor : 0,
+                 reverse ? "reverse" : "forward", ttdSequence(after), ttdSteps(after),
                  result.stepCount, hit.pending ? hit.address : 0);
     }
     if (gTtdStopRequested)
@@ -3886,7 +3977,7 @@ static bool runTtd(bool reverse)
             EXCEPTION_DEBUG_INFO boundary = {};
             boundary.dwFirstChance = TRUE;
             boundary.ExceptionRecord.ExceptionCode = EXCEPTION_BREAKPOINT;
-            boundary.ExceptionRecord.ExceptionAddress = (PVOID)(ULONG_PTR)gTtdCursor->GetProgramCounter();
+            boundary.ExceptionRecord.ExceptionAddress = (PVOID)(ULONG_PTR)ttdProgramCounter();
             setFakeDebugEvent(boundary);
             if (pauseCallback)
             {
@@ -3910,13 +4001,12 @@ static bool runTtd(bool reverse)
     if (exceptionEventHit)
     {
         EXCEPTION_RECORD64 exception = {};
-        exception.ExceptionCode = exceptionEvent.info.ExceptionCode;
-        exception.ExceptionFlags = exceptionEvent.info.ExceptionFlags;
-        exception.ExceptionRecord = exceptionEvent.info.ExceptionRecord;
-        exception.ExceptionAddress = exceptionEvent.info.ExceptionAddress;
-        exception.NumberParameters = (DWORD)(std::min<ULONG64>)(exceptionEvent.info.NumberParameters, EXCEPTION_MAXIMUM_PARAMETERS);
+        exception.ExceptionCode = exceptionEvent.Code;
+        exception.ExceptionFlags = exceptionEvent.Flags;
+        exception.ExceptionAddress = static_cast<ULONG64>(exceptionEvent.ProgramCounter);
+        exception.NumberParameters = (DWORD)(std::min<ULONG64>)(exceptionEvent.ParameterCount, EXCEPTION_MAXIMUM_PARAMETERS);
         for (DWORD i = 0; i < exception.NumberParameters; ++i)
-            exception.ExceptionInformation[i] = exceptionEvent.info.ExceptionInformation[i];
+            exception.ExceptionInformation[i] = exceptionEvent.Parameters[i];
         gEventCallbacks->Exception(&exception, TRUE);
         gTtdMovementCondition.notify_all();
         return true;
@@ -3941,7 +4031,7 @@ static bool runTtd(bool reverse)
             EXCEPTION_DEBUG_INFO boundary = {};
             boundary.dwFirstChance = TRUE;
             boundary.ExceptionRecord.ExceptionCode = EXCEPTION_BREAKPOINT;
-            boundary.ExceptionRecord.ExceptionAddress = (PVOID)(ULONG_PTR)gTtdCursor->GetProgramCounter();
+            boundary.ExceptionRecord.ExceptionAddress = (PVOID)(ULONG_PTR)ttdProgramCounter();
             setFakeDebugEvent(boundary);
             dispatchSystemBreakpoint(&boundary);
             gTtdMovementCondition.notify_all();
@@ -4132,8 +4222,8 @@ __declspec(dllexport) bool DeleteBPX(ULONG_PTR bpxAddress)
         {
             if (gSessionKind == UE_SESSION_TTD)
             {
-                TTD::TTD_Replay_MemoryWatchpointData watchpoint { bpxAddress, 1, TTD::BP_FLAGS::EXEC };
-                if (!gTtdCursor || !gTtdCursor->RemoveMemoryWatchpoint(&watchpoint))
+                const auto watchpoint = ttdWatchpoint(bpxAddress, 1, TTDReplay::DataAccessMask::Execute);
+                if (!gTtdCursor || !gTtdCursor->RemoveMemoryWatchpoint(watchpoint))
                     return false;
                 gBreakpoints.erase(id);
                 return true;
@@ -4202,12 +4292,8 @@ __declspec(dllexport) bool SetMemoryBPXEx(ULONG_PTR MemoryStart, SIZE_T SizeOfMe
     info.callback = bpxCallBack;
     if (gSessionKind == UE_SESSION_TTD)
     {
-        TTD::TTD_Replay_MemoryWatchpointData watchpoint {
-            MemoryStart,
-            SizeOfMemory,
-            ttdMemoryWatchFlags(BreakPointType),
-        };
-        if (!gTtdCursor || !gTtdCursor->AddMemoryWatchpoint(&watchpoint))
+        const auto watchpoint = ttdWatchpoint(MemoryStart, SizeOfMemory, ttdMemoryWatchMask(BreakPointType));
+        if (!gTtdCursor || !gTtdCursor->AddMemoryWatchpoint(watchpoint))
         {
             SetLastError(ERROR_GEN_FAILURE);
             return false;
@@ -4316,14 +4402,9 @@ static bool readTtdContext(HANDLE threadHandle, TITAN_ENGINE_CONTEXT_t* titan)
         threadId = found->second.systemId;
     }
 
-    auto contextBuffer = gTtdCursor->AllocateContextBuffer();
-    const auto context = gTtdCursor->GetCrossPlatformContext(threadId, contextBuffer);
-    if (!context)
-    {
-        gTtdCursor->FreeContextBuffer(contextBuffer);
-        SetLastError(ERROR_INVALID_DATA);
-        return false;
-    }
+    // CONTEXT requires 16-byte alignment on x64; RegisterContext only guarantees 8.
+    alignas(16) const auto registers = gTtdCursor->GetCrossPlatformContext(static_cast<TTDReplay::ThreadId>(threadId));
+    const void* context = &registers;
 #ifdef _WIN64
     const auto native = static_cast<const CONTEXT*>(context);
     titan->cax = native->Rax;
@@ -4404,7 +4485,6 @@ static bool readTtdContext(HANDLE threadHandle, TITAN_ENGINE_CONTEXT_t* titan)
         titan->YmmRegisters[i].Low = titan->XmmRegisters[i];
     }
 #endif
-    gTtdCursor->FreeContextBuffer(contextBuffer);
     return true;
 }
 
@@ -5672,7 +5752,7 @@ __declspec(dllexport) HANDLE TitanOpenProcess(DWORD dwDesiredAccess, bool bInher
         constexpr ULONG processIndex = 0;
         const auto handle = createSyntheticTitanHandle(TitanHandleType::Process, processIndex, dwProcessId, true);
         gDebugIdMap.processHandleToIndex[handle] = processIndex;
-        gProcessPebCache[handle] = gTtdEngine ? gTtdEngine->GetPebAddress() : 0;
+        gProcessPebCache[handle] = gTtdEngine ? static_cast<ULONG64>(gTtdEngine->GetPebAddress()) : 0;
         return handle;
     }
     if (gSessionKind == UE_SESSION_MINIDUMP)
@@ -5705,11 +5785,12 @@ __declspec(dllexport) HANDLE TitanOpenThread(DWORD dwDesiredAccess, bool bInheri
         const auto threads = gTtdEngine->GetThreadList();
         for (size_t i = 0; threads && i < count; ++i)
         {
-            if (threads[i].threadid != dwThreadId)
+            if (ttdSystemThreadId(threads[i]) != dwThreadId)
                 continue;
-            const auto handle = createSyntheticTitanHandle(TitanHandleType::Thread, threads[i].unk1, dwThreadId, true);
-            gDebugIdMap.threadHandleToIndex[handle] = threads[i].unk1;
-            gProcessTebCache[handle] = gTtdCursor->GetTebAddress(dwThreadId);
+            const auto uniqueId = ttdUniqueThreadId(threads[i]);
+            const auto handle = createSyntheticTitanHandle(TitanHandleType::Thread, uniqueId, dwThreadId, true);
+            gDebugIdMap.threadHandleToIndex[handle] = uniqueId;
+            gProcessTebCache[handle] = ttdTebAddress(dwThreadId);
             return handle;
         }
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -5791,14 +5872,11 @@ __declspec(dllexport) bool TitanGetModulePathW(HANDLE hProcess, ULONG_PTR Module
     }
     if (gSessionKind == UE_SESSION_TTD)
     {
-        const auto modules = gTtdCursor ? gTtdCursor->GetModuleList() : nullptr;
-        const auto count = gTtdCursor ? gTtdCursor->GetModuleCount() : 0;
-        for (size_t i = 0; modules && i < count; ++i)
+        for (const auto& module : ttdCurrentModules())
         {
-            const auto module = modules[i].module;
-            if (!module || module->base_addr != (ULONG64)ModuleBase || !module->path)
+            if (module.base != (ULONG64)ModuleBase)
                 continue;
-            std::wstring path(module->path, module->path_len);
+            const auto& path = module.path;
             if (path.size() + 1 > cchPath)
             {
                 *szPath = L'\0';

@@ -129,11 +129,6 @@ set(DbgEngTitanEngine_SOURCES
 	cmake.toml
 	"src/TTD/TTD.cpp"
 	"src/TTD/TTD.hpp"
-	"src/TTD/csts.h"
-	"src/TTD/sha256.cpp"
-	"src/TTD/sha256.h"
-	"src/TTD/utils.cpp"
-	"src/TTD/utils.h"
 	"src/TitanEngine/FileMap.h"
 	"src/TitanEngine/TitanEngine.cpp"
 	"src/TitanEngine/TitanEngine.h"
@@ -146,6 +141,10 @@ source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${DbgEngTitanEngine_SOURCES}
 
 target_compile_features(DbgEngTitanEngine PUBLIC
 	cxx_std_20
+)
+
+target_include_directories(DbgEngTitanEngine PRIVATE
+	"third_party/TTD/include"
 )
 
 target_link_libraries(DbgEngTitanEngine PUBLIC
